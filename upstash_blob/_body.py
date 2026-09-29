@@ -83,6 +83,17 @@ def _is_file(body: Any) -> bool:
     return hasattr(body, "read") and callable(body.read)
 
 
+def _reads_chunks(body: Any) -> bool:
+    """read(n) works. aiohttp's BodyPartReader has a read() that takes no size, and iterates instead."""
+    try:
+        inspect.signature(body.read).bind(CHUNK)
+    except TypeError:
+        return False
+    except ValueError:
+        return True
+    return True
+
+
 def _iter_checked(body: Iterable[Any]) -> Iterator[bytes]:
     for chunk in body:
         b = _as_bytes(chunk)
@@ -147,7 +158,7 @@ def aresolve(body: Any) -> Resolved:
     if common is not None:
         return common
     # Before __aiter__: an aiofiles file is async-iterable too, but line by line.
-    if _is_file(body):
+    if _is_file(body) and _reads_chunks(body):
         # An async file object (aiofiles) cannot say its size without awaiting; pass size= for it.
         size = None if inspect.iscoroutinefunction(body.read) else _file_size(body)
         return Resolved(_aread_file(body), size, _guess(getattr(body, "name", None)))

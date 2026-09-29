@@ -42,7 +42,7 @@ from upstash_blob._core import (
     safe_content_type,
     transport_error,
 )
-from upstash_blob._keys import decode_entities, encode_key, meta_headers, presignable_key, tag
+from upstash_blob._keys import decode_entities, encode_key, meta_headers, nameable, presignable_key, tag
 from upstash_blob._multipart import MultipartOption, part_count, part_size_for, wants_multipart
 from upstash_blob._sniff import check_content_type, expand_content_types
 from upstash_blob._token import AGENT_URL
@@ -161,8 +161,10 @@ class AsyncBucket:
         body is never retried either: it has already been read once.
         """
         streaming = content is not None and not isinstance(content, (bytes, str))
-        retriable = not streaming and method in RETRIABLE_METHODS and not is_conditional(headers)
-        attempts = RETRY_ATTEMPTS if retriable else 1
+        attempts = RETRY_ATTEMPTS if not streaming and method in RETRIABLE_METHODS else 1
+        # A conditional write whose reply was lost may have landed, and sent again it would refuse
+        # itself with a 412. Only answers that say it was not applied (429, 503) are asked again.
+        conditional = is_conditional(headers)
         refreshed = False
         attempt = 0
         while True:
@@ -175,7 +177,7 @@ class AsyncBucket:
             except httpx.LocalProtocolError:
                 raise refused_to_send() from None
             except httpx.TransportError as e:
-                if attempt >= attempts:
+                if attempt >= attempts or conditional:
                     raise transport_error(e) from e
                 await asyncio.sleep(backoff(attempt, None))
                 continue
@@ -190,7 +192,10 @@ class AsyncBucket:
                         refreshed = True
                         continue
                 return res
-            if attempt < attempts and (res.status_code == 429 or res.status_code >= 500):
+            unapplied = (
+                res.status_code in (429, 503) if conditional else res.status_code == 429 or res.status_code >= 500
+            )
+            if attempt < attempts and unapplied:
                 await res.aclose()
                 await asyncio.sleep(backoff(attempt, res.headers.get("retry-after")))
                 continue
@@ -223,7 +228,7 @@ class AsyncBucket:
             except httpx.TransportError as e:
                 # A hung agent is not asked again: three timeouts would hold a request for 30 s.
                 if isinstance(e, httpx.TimeoutException) or attempt >= RETRY_ATTEMPTS:
-                    raise BlobError("request_failed", "could not reach the signing service", status=502) from e
+                    raise BlobError("request_failed", "could not reach the signing service", status=502) from None
                 await asyncio.sleep(backoff(attempt, None))
                 continue
             if attempt < RETRY_ATTEMPTS and presign_retriable(res):
@@ -570,6 +575,8 @@ class AsyncBucket:
             return
         if paths is not None:
             paths = list(paths)
+            for p in paths:
+                encode_key(p)
             failed: List[str] = []
             for i in range(0, len(paths), 1000):
                 failed += await self._delete_batch(paths[i : i + 1000])
@@ -605,7 +612,8 @@ class AsyncBucket:
         if not res.is_success:
             raise error_from_body(res.status_code, res.text)
         # S3 answers 200 with errors inside; a survivor is the truth, so ask again rather than trust the list.
-        return [p for p in delete_errors(res.text) if await self.exists(p)]
+        # A key no url can name (a "." segment) cannot be asked about, so it counts as a survivor.
+        return [p for p in delete_errors(res.text) if not nameable(p) or await self.exists(p)]
 
     # ----------------------------------------------------------- multipart
 
@@ -654,7 +662,7 @@ class AsyncBucket:
         stale = [
             u
             for u in await self.list_multipart_uploads(prefix=prefix)
-            if u.initiated_at and u.initiated_at.timestamp() <= cutoff
+            if u.initiated_at and u.initiated_at.timestamp() <= cutoff and nameable(u.path)
         ]
         for u in stale:
             await self._abort_multipart(u.path, u.upload_id)

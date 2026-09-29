@@ -15,7 +15,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from upstash_blob._keys import blocks, decode_entities, encode_key, escape_xml, presignable_key, tag, uri_encode
+from upstash_blob._keys import blocks, decode_entities, encode_key, escape_xml, nameable, presignable_key, tag
 from upstash_blob._sigv4 import canonical_query, sign_headers
 from upstash_blob._telemetry import telemetry_headers
 from upstash_blob._token import DOMAIN_SUFFIX, decode_token
@@ -163,8 +163,10 @@ class CredentialCache:
         return self._current
 
     def invalidate(self) -> None:
-        """After a 403 that named the credential itself: the next get() mints."""
-        self._current = None
+        """
+        After a 403 that named the credential itself: the next get() mints. The credential stays
+        peekable, since its visibility is still true and a private bucket must not look public.
+        """
         self._refresh_at = 0.0
 
     def _store(self, creds: Credentials) -> Credentials:
@@ -459,8 +461,7 @@ def complete_body(parts: Sequence[Tuple[int, str]]) -> str:
 
 
 def delete_body(paths: Sequence[str]) -> str:
-    for p in paths:
-        encode_key(p)
+    # Keys travel in XML, not a url, so a listed key with a "." segment is deletable here.
     inner = "".join(f"<Object><Key>{escape_xml(p)}</Key></Object>" for p in paths)
     return f"<Delete>{inner}</Delete>"
 
@@ -525,9 +526,11 @@ class BucketCore:
     def _public_url(self, path: str) -> Optional[str]:
         if self._visibility() == "private":
             return None
-        # Not encode_key: a listed key is whatever storage holds, and a "." segment in one must not
-        # break the page it is on. Paths a caller passes in are checked where they are taken.
-        return f"https://{self._hostname}/{'/'.join(uri_encode(s) for s in path.split('/'))}"
+        # A listed key is whatever storage holds. One with a "." segment has no url: a browser would
+        # resolve it to a different object, and it must not break the page it is on either.
+        if not nameable(path):
+            return None
+        return f"https://{self._hostname}/{encode_key(path)}"
 
     def _blob(self, path: str, size: int, etag: str, uploaded_at: datetime) -> BlobObject:
         url = self._public_url(path)

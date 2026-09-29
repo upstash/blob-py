@@ -25,6 +25,15 @@ def encode_key(path: str) -> str:
     return "/".join(uri_encode(s) for s in segments)
 
 
+def nameable(path: str) -> bool:
+    """Whether a url can name this key. One that storage listed may hold a "." segment."""
+    try:
+        encode_key(path)
+    except ValueError:
+        return False
+    return True
+
+
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 

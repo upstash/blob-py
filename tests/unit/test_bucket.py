@@ -584,3 +584,64 @@ class TestAsyncBodies:
         f.write_bytes(b"%PDF-1.7" + b"x" * 100_000)
         blob = await abucket.put("doc.pdf", f, content_types=["application/pdf"])
         assert (blob.content_type, blob.size) == ("application/pdf", 100_008)
+
+
+class TestSecondPassRegressions:
+    def test_a_conditional_put_is_still_retried_on_429(self, fake: Fake, bucket: Bucket) -> None:
+        bucket.put("n.json", "0")
+        answers = [httpx.Response(429, headers={"retry-after": "0"})]
+        fake.intercept = lambda r: answers.pop(0) if r.method == "PUT" and answers else None
+        bucket.update_json("n.json", lambda prev: prev + 1)
+        assert fake.objects["n.json"].data == b"1"
+
+    def test_dot_keys_do_not_stop_a_prefix_delete_or_a_sweep(self, fake: Fake, bucket: Bucket) -> None:
+        from tests.fake import Obj
+
+        bucket.put("logs/a", "x")
+        fake.objects["logs/./b"] = Obj(b"", {}, '"e"', 0)
+        assert [b.url for b in bucket.list(prefix="logs/").blobs if b.path == "logs/./b"] == [None]
+        bucket.delete(prefix="logs/")
+        assert fake.objects == {}
+        fake.uploads["bad"] = ("tmp/../x", {}, {}, 0.0)
+        fake.uploads["good"] = ("tmp/y", {}, {}, 0.0)
+        assert [u.upload_id for u in bucket.abort_stale_multipart_uploads(older_than="1h", prefix="tmp/")] == ["good"]
+        with pytest.raises(ValueError):
+            bucket.delete(["ok", "../x"])
+
+    def test_presign_transport_errors_drop_the_cause(self, fake: Fake, bucket: Bucket) -> None:
+        def drop(body: Any) -> httpx.Response:
+            raise httpx.ConnectError("x")
+
+        fake.presign_response = drop
+        with pytest.raises(BlobError) as e:
+            bucket.signed_read_url("a")
+        assert e.value.__cause__ is None and e.value.__suppress_context__
+
+    def test_a_private_bucket_stays_private_after_a_rejected_credential(self, fake: Fake, bucket: Bucket) -> None:
+        fake.visibility = "private"
+        bucket.put("a.txt", "x")
+        answers = [error(403, "ExpiredToken")]
+        fake.intercept = lambda r: answers.pop(0) if answers else None
+        bucket.exists("a.txt")
+        assert bucket._core._visibility() == "private"
+        assert bucket.list().blobs[0].url is None
+
+    def test_a_raw_cache_header_is_printable_ascii(self, bucket: Bucket) -> None:
+        assert code_of(bucket.put, "c", "x", cache="public, max-age=60 —") == "invalid_input"
+
+
+class TestAiohttpBodyPart:
+    async def test_a_read_without_a_size_is_iterated(self, fake: Fake, abucket: AsyncBucket) -> None:
+        class BodyPart:
+            async def read(self, *, decode: bool = False) -> bytes:
+                raise AssertionError("read whole")
+
+            def __aiter__(self) -> Any:
+                async def gen() -> Any:
+                    yield b"hello "
+                    yield b"world"
+
+                return gen()
+
+        await abucket.put("part", BodyPart(), size=11)
+        assert fake.objects["part"].data == b"hello world"

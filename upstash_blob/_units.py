@@ -3,6 +3,8 @@ import re
 from datetime import timedelta
 from typing import Dict, Literal, Optional, Union
 
+from upstash_blob.errors import BlobError
+
 # Sizes are decimal ('2mb' = 2,000,000), matching how storage is billed. The only binary math in
 # the SDK is multipart part sizing, because R2's part floor is 5 MiB.
 Size = Union[int, str]
@@ -119,6 +121,7 @@ def format_bytes(size: float) -> str:
 
 # A directive separator is what tells the two apart: a header always has one, a duration never does.
 _RAW_HEADER = re.compile(r"[=,]")
+_PRINTABLE = re.compile(r"[\x20-\x7e]*")
 
 
 def cache_control(cache: Optional[CacheOption], visibility: str = "public") -> str:
@@ -136,5 +139,8 @@ def cache_control(cache: Optional[CacheOption], visibility: str = "public") -> s
     if cache == "no-store":
         return "no-store"
     if isinstance(cache, str) and _RAW_HEADER.search(cache):
-        return cache.strip()
+        raw = cache.strip()
+        if not _PRINTABLE.fullmatch(raw):
+            raise BlobError("invalid_input", "cache: a header value is printable ASCII")
+        return raw
     return f"{scope}, max-age={math.floor(parse_duration(cache, 'cache'))}"
