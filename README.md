@@ -100,7 +100,7 @@ const upload = useUpload('avatar');  // POSTs to /api/upload?route=avatar
 - Django: `path("api/upload", upload_view(uploads))` from `upstash_blob.django`, with either
   handler. Flask: `app.add_url_rule("/api/upload", view_func=upload_view(uploads), methods=["GET", "POST"])`
   from `upstash_blob.flask`, with `UploadHandler`. Anything else: `handler.handle(method, request=...,
-  route=..., body=..., headers=...)` returns an `UploadResponse`.
+  route=..., body=..., headers=..., native=<framework response class>)` returns an `UploadResponse`.
 - Omit `bucket=` to use `UPSTASH_BLOB_TOKEN`. Every handler option is a default a route may replace;
   `content_types=None` or `max_size=None` on a route clears the handler's.
 - `input=` validates what the browser sends as `input`: a pydantic model, a `TypeAdapter`, or a

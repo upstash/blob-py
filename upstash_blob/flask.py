@@ -8,6 +8,7 @@ Mounts an ``UploadHandler`` on Flask.
 from typing import Any, Callable
 
 from flask import Response, request
+from werkzeug.wrappers import Response as WerkzeugResponse
 
 from upstash_blob._upload import MAX_BODY, UploadResponse
 from upstash_blob._upload_sync import UploadHandler
@@ -40,7 +41,7 @@ def upload_view(uploads: UploadHandler, name: str = "upstash_blob_upload") -> Ca
             route=req.args.get("route"),
             body=_body(req) if req.method == "POST" else b"",
             headers=req.headers,
-            native=Response,
+            native=WerkzeugResponse,
         )
         if isinstance(res, UploadResponse):
             return Response(res.body, status=res.status, headers=res.headers)
