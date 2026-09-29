@@ -594,6 +594,18 @@ class TestSecondPassRegressions:
         bucket.update_json("n.json", lambda prev: prev + 1)
         assert fake.objects["n.json"].data == b"1"
 
+    def test_a_conditional_put_resends_after_a_connect_failure(self, fake: Fake, bucket: Bucket) -> None:
+        failed: list = []
+
+        def refuse_once(r: httpx.Request) -> Optional[httpx.Response]:
+            if r.method == "PUT" and not failed:
+                failed.append(1)
+                raise httpx.ConnectError("refused", request=r)
+            return None
+
+        fake.intercept = refuse_once
+        assert bucket.put("once", "x", allow_overwrite=False).size == 1
+
     def test_dot_keys_do_not_stop_a_prefix_delete_or_a_sweep(self, fake: Fake, bucket: Bucket) -> None:
         from tests.fake import Obj
 
@@ -620,10 +632,12 @@ class TestSecondPassRegressions:
     def test_a_private_bucket_stays_private_after_a_rejected_credential(self, fake: Fake, bucket: Bucket) -> None:
         fake.visibility = "private"
         bucket.put("a.txt", "x")
-        answers = [error(403, "ExpiredToken")]
-        fake.intercept = lambda r: answers.pop(0) if answers else None
-        bucket.exists("a.txt")
+        fake.intercept = lambda r: error(403, "ExpiredToken")
+        fake.mint_response = lambda: httpx.Response(401)
+        assert code_of(bucket.exists, "a.txt") == "unauthorized"
         assert bucket._core._visibility() == "private"
+        fake.intercept = None
+        fake.mint_response = None
         assert bucket.list().blobs[0].url is None
 
     def test_a_raw_cache_header_is_printable_ascii(self, bucket: Bucket) -> None:

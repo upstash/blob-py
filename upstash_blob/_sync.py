@@ -175,7 +175,9 @@ class Bucket:
             except httpx.LocalProtocolError:
                 raise refused_to_send() from None
             except httpx.TransportError as e:
-                if attempt >= attempts or conditional:
+                # Nothing reached storage on a connect failure, so even a conditional write is safe to resend.
+                unsent = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+                if attempt >= attempts or (conditional and not unsent):
                     raise transport_error(e) from e
                 time.sleep(backoff(attempt, None))
                 continue

@@ -49,10 +49,10 @@ from upstash_blob._token import AGENT_URL
 from upstash_blob._units import CacheOption, Duration, Size, cache_control, format_bytes, parse_duration, parse_size
 from upstash_blob.errors import BlobError
 from upstash_blob.types import (
-    AsyncBlobStream,
     BlobDownload,
     BlobInfo,
     BlobObject,
+    AsyncBlobStream,
     CompletedBlob,
     ListPage,
     MultipartUpload,
@@ -177,7 +177,9 @@ class AsyncBucket:
             except httpx.LocalProtocolError:
                 raise refused_to_send() from None
             except httpx.TransportError as e:
-                if attempt >= attempts or conditional:
+                # Nothing reached storage on a connect failure, so even a conditional write is safe to resend.
+                unsent = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+                if attempt >= attempts or (conditional and not unsent):
                     raise transport_error(e) from e
                 await asyncio.sleep(backoff(attempt, None))
                 continue
