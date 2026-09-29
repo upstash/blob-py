@@ -227,7 +227,9 @@ def presign_payload(
     expires_in: float,
     headers: Optional[Mapping[str, str]] = None,
     query: Optional[Mapping[str, str]] = None,
+    part: Optional[Tuple[int, str]] = None,
 ) -> Dict[str, Any]:
+    """``part`` is ``(part_number, upload_id)``: the url then PUTs one part of a multipart upload."""
     presignable_key(path)
     body: Dict[str, Any] = {
         "method": method,
@@ -238,6 +240,8 @@ def presign_payload(
         body["headers"] = dict(headers)
     if query:
         body["query"] = dict(query)
+    if part is not None:
+        body["partNumber"], body["uploadId"] = part
     return body
 
 
@@ -453,6 +457,13 @@ def parse_uploads(xml: str) -> Tuple[List[MultipartUpload], Optional[str], Optio
     )
 
 
+def parse_parts(xml: str) -> Tuple[List[Tuple[int, str]], Optional[str]]:
+    """The parts on this ListParts page, and the marker for the next one (None when this is the last)."""
+    parts = [(int(tag(b, "PartNumber") or 0), decode_entities(tag(b, "ETag") or "")) for b in blocks(xml, "Part")]
+    marker = tag(xml, "NextPartNumberMarker")
+    return parts, marker if tag(xml, "IsTruncated") == "true" and marker else None
+
+
 def complete_body(parts: Sequence[Tuple[int, str]]) -> str:
     inner = "".join(
         f"<Part><PartNumber>{n}</PartNumber><ETag>{escape_xml(etag)}</ETag></Part>" for n, etag in sorted(parts)
@@ -510,6 +521,8 @@ class BucketCore:
         decoded = decode_token(token)
         self._token = token
         self._bucket_id = decoded.bucket_id
+        # The bucket password, which never leaves the server: the key upload completion tokens are signed with.
+        self._signing_secret = decoded.password
         self._hostname = f"{decoded.hash_for_domain}.{DOMAIN_SUFFIX}"
         self._default_cache = cache
         self._telemetry = enable_telemetry

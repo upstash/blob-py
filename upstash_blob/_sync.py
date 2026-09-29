@@ -32,6 +32,7 @@ from upstash_blob._core import (
     is_conditional,
     mint_wait,
     parse_list,
+    parse_parts,
     parse_uploads,
     presign_payload,
     presign_retriable,
@@ -208,13 +209,14 @@ class Bucket:
         expires_in: float,
         headers: Optional[Mapping[str, str]] = None,
         query: Optional[Mapping[str, str]] = None,
+        part: Optional[Tuple[int, str]] = None,
     ) -> Tuple[str, datetime]:
         """
         A url for one operation on one object, signed by the agent. Never signed here: a url has to
         carry the temporary credential's session token, and R2 derives the credential's secret from
         it, so a url signed with it would hand its holder every object in the bucket.
         """
-        payload = presign_payload(method, path, expires_in, headers, query)
+        payload = presign_payload(method, path, expires_in, headers, query, part)
         attempt = 0
         while True:
             attempt += 1
@@ -267,6 +269,21 @@ class Bucket:
         if tag(res.text, "Code"):
             raise error_from_body(500, res.text)
         return decode_entities(tag(res.text, "ETag") or "")
+
+    def _list_parts(self, path: str, upload_id: str) -> List[Tuple[int, str]]:
+        out: List[Tuple[int, str]] = []
+        marker: Optional[str] = None
+        while True:
+            query = {"uploadId": upload_id, "max-parts": "1000"}
+            if marker:
+                query["part-number-marker"] = marker
+            res = self._fetch("GET", path, query=query)
+            if not res.is_success:
+                raise error_from_body(res.status_code, res.text)
+            parts, marker = parse_parts(res.text)
+            out.extend(parts)
+            if marker is None:
+                return out
 
     def _abort_multipart(self, path: str, upload_id: str) -> None:
         res = self._fetch("DELETE", path, query={"uploadId": upload_id})
