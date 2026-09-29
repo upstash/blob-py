@@ -49,10 +49,10 @@ from upstash_blob._token import AGENT_URL
 from upstash_blob._units import CacheOption, Duration, Size, cache_control, format_bytes, parse_duration, parse_size
 from upstash_blob.errors import BlobError
 from upstash_blob.types import (
+    AsyncBlobStream,
     BlobDownload,
     BlobInfo,
     BlobObject,
-    AsyncBlobStream,
     CompletedBlob,
     ListPage,
     MultipartUpload,
