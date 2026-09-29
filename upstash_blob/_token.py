@@ -1,6 +1,6 @@
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 AGENT_URL = "https://blob.upstash.io"
 DOMAIN_SUFFIX = "blob.upstash.io"
@@ -11,7 +11,7 @@ _TOKEN_VERSION = 0x02
 @dataclass(frozen=True)
 class DecodedToken:
     bucket_id: str
-    password: str
+    password: str = field(repr=False)
     hash_for_domain: str
     """The bucket's public DNS label: ``<hash_for_domain>.blob.upstash.io`` serves its objects."""
     flags: int

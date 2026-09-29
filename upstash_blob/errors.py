@@ -130,6 +130,19 @@ class BlobError(Exception):
         self.retry_after = retry_after
         self.reason = reason
 
+    def __reduce__(self) -> Any:
+        # Exception pickles as cls(*args), which would pass the message as the code.
+        kwargs = {
+            "hint": self.hint,
+            "status": self.status,
+            "failed": self.failed,
+            "etag": self.etag,
+            "size": self.size,
+            "retry_after": self.retry_after,
+            "reason": self.reason,
+        }
+        return (_restore, (self.code, self.message, kwargs))
+
     def __repr__(self) -> str:
         return f"BlobError(code={self.code!r}, status={self.status}, message={self.message!r})"
 
@@ -147,3 +160,7 @@ class BlobError(Exception):
         if self.retry_after is not None:
             out["retryAfter"] = self.retry_after
         return out
+
+
+def _restore(code: BlobErrorCode, message: str, kwargs: Dict[str, Any]) -> BlobError:
+    return BlobError(code, message, **kwargs)

@@ -104,7 +104,8 @@ class MultipartUpload:
 
     path: str
     upload_id: str
-    initiated_at: datetime
+    initiated_at: Optional[datetime]
+    """None when storage sent a date that does not parse; such an upload is never treated as stale."""
 
 
 @dataclass(frozen=True)

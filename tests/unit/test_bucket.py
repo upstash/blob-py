@@ -165,7 +165,9 @@ class TestPut:
             yield b"x" * 1500
             yield b"x" * 1500
 
-        assert code_of(bucket.put, "lying", lying(), size=1000, max_size="2kb") == "too_large"
+        # A declared size is checked against max_size up front, and the stream against the declared size.
+        assert code_of(bucket.put, "lying", lying(), size=3000, max_size="2kb") == "too_large"
+        assert code_of(bucket.put, "lying", lying(), size=1000, max_size="2kb") == "invalid_input"
         assert "lying" not in fake.objects
 
     def test_unknown_length_buffers_under_max_size_or_is_refused(self, fake: Fake, bucket: Bucket) -> None:
@@ -465,3 +467,120 @@ class TestAsync:
         assert read.url.startswith(ENDPOINT)
         cfg = await abucket.s3()
         assert cfg.bucket == "bkt"
+
+
+class TestReviewRegressions:
+    def test_a_conditional_put_is_sent_once(self, fake: Fake, bucket: Bucket) -> None:
+        # The write lands, the answer is lost: a retry would 412 against the SDK's own write.
+        fake.objects.clear()
+        dropped = []
+
+        def lose_reply(r: httpx.Request) -> Optional[httpx.Response]:
+            if r.method == "PUT" and not dropped:
+                dropped.append(fake.r2(r))
+                raise httpx.ReadTimeout("lost", request=r)
+            return None
+
+        fake.intercept = lose_reply
+        assert code_of(bucket.put, "c.json", "{}", allow_overwrite=False) == "request_failed"
+        assert len([c for c in fake.r2_calls() if c.method == "PUT"]) == 1
+
+    def test_update_json_does_not_run_fn_twice_on_a_lost_reply(self, fake: Fake, bucket: Bucket) -> None:
+        bucket.put("n.json", '{"n":0}')
+        lost = []
+
+        def lose_reply(r: httpx.Request) -> Optional[httpx.Response]:
+            if r.method == "PUT" and "if-match" in r.headers and not lost:
+                lost.append(fake.r2(r))
+                raise httpx.ReadTimeout("lost", request=r)
+            return None
+
+        fake.intercept = lose_reply
+        with pytest.raises(BlobError):
+            bucket.update_json("n.json", lambda prev: {"n": prev["n"] + 1})
+        assert json.loads(fake.objects["n.json"].data) == {"n": 1}
+
+    def test_a_token_with_a_trailing_newline(self, fake: Fake) -> None:
+        make(fake, TOKEN + "\n").exists("a")
+        assert fake.calls[0].headers["authorization"] == f"Bearer {TOKEN}"
+
+    def test_a_dropped_mint_is_retried_and_the_token_stays_out_of_the_cause(self, fake: Fake, bucket: Bucket) -> None:
+        answers: list = [httpx.ConnectError("x"), httpx.Response(200, json=fake.creds())]
+
+        def mint() -> httpx.Response:
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a
+
+        fake.mint_response = mint
+        assert bucket.exists("a") is False
+        reset_credential_caches()
+        fake.mint_response = lambda: (_ for _ in ()).throw(httpx.ConnectTimeout("slow"))
+        with pytest.raises(BlobError) as e:
+            make(fake).exists("a")
+        assert e.value.__cause__ is None and e.value.__suppress_context__
+
+    def test_a_streamed_upload_that_hits_an_expired_credential_clears_it(self, fake: Fake, bucket: Bucket) -> None:
+        bucket.exists("warm")
+        fake.intercept = lambda r: error(403, "ExpiredToken") if r.method == "PUT" else None
+        assert code_of(bucket.put, "s", iter([b"abc"]), size=3) == "unauthorized"
+        fake.intercept = None
+        assert bucket.put("s", iter([b"abc"]), size=3).size == 3
+        assert fake.mints == 2
+
+    def test_headers_httpx_would_refuse_are_invalid_input_not_a_network_error(self, fake: Fake, bucket: Bucket) -> None:
+        assert code_of(bucket.put, "m", "x", metadata={"a": " x"}) == "invalid_input"
+        assert code_of(bucket.put, "m", "x", content_type="text/plain\r\nx: y") == "invalid_input"
+        assert code_of(bucket.put, "m", "x", content_type="tëxt/plain") == "invalid_input"
+        assert code_of(bucket.put, "m", "x", if_unchanged='"a"\r\nx: y') == "invalid_input"
+        assert fake.r2_calls() == []
+        bucket.put("src", "x")
+        assert code_of(bucket.copy, "src", "dst", content_type="a\nb") == "invalid_input"
+
+    def test_a_stream_that_ends_short_or_runs_long(self, fake: Fake, bucket: Bucket) -> None:
+        assert code_of(bucket.put, "short", iter([b"ab"]), size=3) == "invalid_input"
+        assert code_of(bucket.put, "long", iter([b"abcd"]), size=3) == "invalid_input"
+        assert "short" not in fake.objects and "long" not in fake.objects
+
+    def test_a_listed_key_with_a_dot_segment_does_not_break_the_page(self, fake: Fake, bucket: Bucket) -> None:
+        fake.objects["a/../b"] = fake.objects.get("x") or __import__("tests.fake", fromlist=["Obj"]).Obj(
+            b"", {}, '"e"', 0
+        )
+        assert [b.path for b in bucket.list().blobs] == ["a/../b"]
+
+    def test_an_unparseable_initiated_date_is_never_stale(self, fake: Fake, bucket: Bucket) -> None:
+        body = (
+            "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>"
+            "<Upload><Key>k</Key><UploadId>u</UploadId><Initiated>garbage</Initiated></Upload>"
+            "</ListMultipartUploadsResult>"
+        )
+        fake.intercept = lambda r: httpx.Response(200, content=body.encode()) if "uploads" in str(r.url) else None
+        assert bucket.abort_stale_multipart_uploads(older_than=0) == []
+        assert bucket.list_multipart_uploads()[0].initiated_at is None
+
+
+class TestAsyncBodies:
+    async def test_an_async_file_is_read_in_chunks_not_lines(self, fake: Fake, abucket: AsyncBucket) -> None:
+        class AsyncFile:
+            name = "photo.png"
+
+            def __init__(self, data: bytes) -> None:
+                self._f = io.BytesIO(data)
+
+            async def read(self, n: int = -1) -> bytes:
+                return self._f.read(n)
+
+            def __aiter__(self) -> Any:
+                raise AssertionError("read line by line")
+
+        data = PNG + b"\x00" * 200_000
+        blob = await abucket.put("a.png", AsyncFile(data), size=len(data))
+        assert blob.content_type == "image/png"
+        assert fake.objects["a.png"].data == data
+
+    async def test_a_path_body(self, fake: Fake, abucket: AsyncBucket, tmp_path: Path) -> None:
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(b"%PDF-1.7" + b"x" * 100_000)
+        blob = await abucket.put("doc.pdf", f, content_types=["application/pdf"])
+        assert (blob.content_type, blob.size) == ("application/pdf", 100_008)

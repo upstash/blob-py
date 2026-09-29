@@ -238,3 +238,62 @@ class TestUniquePath:
         assert re.fullmatch(r"u/file-\w{8}", unique_path("u/{name}", name="///"))
         assert re.fullmatch(r"docs/r-sum-\w{8}\.pdf", unique_path("docs/{}", "r​ésum.pdf".replace("é", "-")))
         assert unique_path("x/{}", "a") != unique_path("x/{}", "a")
+
+
+class TestReviewRegressions:
+    def test_a_backslash_url_is_not_r2(self) -> None:
+        from upstash_blob._core import _r2_https
+
+        assert _r2_https("https://acc.r2.cloudflarestorage.com/b/k")
+        assert not _r2_https("https://evil.example\\@acc.r2.cloudflarestorage.com/b/k")
+        assert not _r2_https("https://user@acc.r2.cloudflarestorage.com/b/k")
+
+    def test_secrets_stay_out_of_repr(self) -> None:
+        from upstash_blob._core import Credentials
+
+        c = Credentials("AK", "SECRET", "SESSION", "https://a.r2.cloudflarestorage.com", "b", "auto", 0, None)
+        assert "SECRET" not in repr(c) and "SESSION" not in repr(c)
+        assert "pw-secret" not in repr(decode_token(encode_token("id", "pw-secret", "h")))
+
+    def test_iso_dates(self) -> None:
+        from upstash_blob._core import iso_date
+
+        assert iso_date("2026-09-29T10:00:00.12Z") == datetime(2026, 9, 29, 10, 0, 0, 120000, timezone.utc)
+        assert iso_date("2026-09-29T10:00:00.1234567Z") == datetime(2026, 9, 29, 10, 0, 0, 123456, timezone.utc)
+        assert iso_date("2026-09-29T12:00:00+02:00") == datetime(2026, 9, 29, 10, 0, 0, tzinfo=timezone.utc)
+        assert iso_date("nope") is None
+
+    def test_blob_error_pickles(self) -> None:
+        import copy
+        import pickle
+
+        e = BlobError("already_exists", "a exists", etag='"e"', size=3, reason="r")
+        for back in (pickle.loads(pickle.dumps(e)), copy.copy(e)):
+            assert (back.code, back.message, back.etag, back.size, back.reason) == (
+                "already_exists",
+                "A exists",
+                '"e"',
+                3,
+                "r",
+            )
+        hinted = BlobError("length_required")
+        assert pickle.loads(pickle.dumps(hinted)).message == hinted.message
+
+    def test_an_infinite_expiry_is_unexpected(self) -> None:
+        import httpx
+
+        from upstash_blob._core import presigned_from
+
+        for expires in (1e999, 1e300):
+            res = httpx.Response(
+                200, content=f'{{"url": "https://a.r2.cloudflarestorage.com/x", "expiresAt": {expires}}}'.encode()
+            )
+            with pytest.raises(BlobError) as e:
+                presigned_from(res)
+            assert e.value.code == "request_failed"
+
+    def test_the_signed_host_is_the_one_httpx_sends(self) -> None:
+        from upstash_blob._core import normalized_host
+
+        assert normalized_host("https://ACC.r2.cloudflarestorage.com:443") == "acc.r2.cloudflarestorage.com"
+        assert normalized_host("https://acc.r2.cloudflarestorage.com:8443") == "acc.r2.cloudflarestorage.com:8443"

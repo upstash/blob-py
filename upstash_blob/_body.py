@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import mimetypes
 import os
@@ -114,8 +115,10 @@ def resolve(body: Any) -> Resolved:
 
 
 async def _aread_file(f: Any) -> AsyncIterator[bytes]:
+    # A sync file is read on a worker thread so the event loop is never blocked on disk.
+    sync = not inspect.iscoroutinefunction(f.read)
     while True:
-        chunk = f.read(CHUNK)
+        chunk = await asyncio.to_thread(f.read, CHUNK) if sync else f.read(CHUNK)
         if inspect.isawaitable(chunk):
             chunk = await chunk
         b = _as_bytes(chunk)
@@ -137,17 +140,19 @@ async def _aiter_checked(body: AsyncIterable[Any]) -> AsyncIterator[bytes]:
 
 
 def aresolve(body: Any) -> Resolved:
+    if isinstance(body, os.PathLike):
+        f = open(body, "rb")
+        return Resolved(_aread_file(f), _file_size(f), _guess(body), f.close)
     common = _resolve_common(body)
     if common is not None:
-        if not isinstance(common.data, bytes):
-            common.data = _aiter_sync(common.data)
         return common
-    if hasattr(body, "__aiter__"):
-        return Resolved(_aiter_checked(body), None, None)
+    # Before __aiter__: an aiofiles file is async-iterable too, but line by line.
     if _is_file(body):
         # An async file object (aiofiles) cannot say its size without awaiting; pass size= for it.
         size = None if inspect.iscoroutinefunction(body.read) else _file_size(body)
         return Resolved(_aread_file(body), size, _guess(getattr(body, "name", None)))
+    if hasattr(body, "__aiter__"):
+        return Resolved(_aiter_checked(body), None, None)
     if isinstance(body, Iterable):
         return Resolved(_aiter_sync(_iter_checked(body)), None, None)
     raise TypeError(
@@ -157,6 +162,10 @@ def aresolve(body: Any) -> Resolved:
 
 def _too_large(max_size: int) -> BlobError:
     return BlobError("too_large", f"body exceeds max_size ({max_size} bytes)")
+
+
+def _mismatch(sent: int, size: int) -> BlobError:
+    return BlobError("invalid_input", f"body was {sent}{'+' if sent > size else ''} bytes, {size} were declared")
 
 
 # ------------------------------------------------------------------ sync
@@ -209,6 +218,24 @@ def limit(data: Data, max_size: int) -> Data:
             if seen > max_size:
                 raise _too_large(max_size)
             yield chunk
+
+    return counted(data)
+
+
+def exact(data: Data, size: int) -> Data:
+    """A streamed body that ends short or runs long is the caller's mistake, named before httpx sees it."""
+    if isinstance(data, bytes):
+        return data
+
+    def counted(it: Iterator[bytes]) -> Iterator[bytes]:
+        sent = 0
+        for chunk in it:
+            sent += len(chunk)
+            if sent > size:
+                raise _mismatch(sent, size)
+            yield chunk
+        if sent != size:
+            raise _mismatch(sent, size)
 
     return counted(data)
 
@@ -277,6 +304,23 @@ def alimit(data: AsyncData, max_size: int) -> AsyncData:
             if seen > max_size:
                 raise _too_large(max_size)
             yield chunk
+
+    return counted(data)
+
+
+def aexact(data: AsyncData, size: int) -> AsyncData:
+    if isinstance(data, bytes):
+        return data
+
+    async def counted(it: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        sent = 0
+        async for chunk in it:
+            sent += len(chunk)
+            if sent > size:
+                raise _mismatch(sent, size)
+            yield chunk
+        if sent != size:
+            raise _mismatch(sent, size)
 
     return counted(data)
 

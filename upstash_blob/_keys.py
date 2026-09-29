@@ -71,7 +71,8 @@ def meta_headers(metadata: Optional[Mapping[str, str]]) -> Dict[str, str]:
             raise BlobError("invalid_input", f'metadata key "{k}" is not a valid header name')
         if not isinstance(v, str):
             raise BlobError("invalid_input", f"metadata.{k} must be a string")
-        if not _ASCII.fullmatch(v):
+        # h11 refuses a value with leading or trailing whitespace, which fetch would trim silently.
+        if not _ASCII.fullmatch(v) or v != v.strip():
             raise BlobError(
                 "invalid_input",
                 f"metadata.{k} has characters storage does not carry back unchanged",

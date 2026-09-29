@@ -24,18 +24,21 @@ from upstash_blob._core import (
     Head,
     attachment_disposition,
     backoff,
+    check_etag,
     complete_body,
     credentials_from,
     delete_body,
     delete_errors,
     error_from_body,
     head_from_headers,
+    is_conditional,
     mint_wait,
     parse_list,
     parse_uploads,
     presign_payload,
     presign_retriable,
     presigned_from,
+    refused_to_send,
     safe_content_type,
     transport_error,
 )
@@ -125,7 +128,13 @@ class AsyncBucket:
                     f"{AGENT_URL}/v1/credentials", headers=self._core._agent_headers(), timeout=AGENT_TIMEOUT
                 )
             except httpx.TransportError as e:
-                raise transport_error(e, "the credential service") from e
+                # A dropped connection is asked again; a hung agent is not. No cause: the request
+                # being refused carries the bearer token.
+                if isinstance(e, httpx.TimeoutException) or attempt >= 2:
+                    raise transport_error(e, "the credential service") from None
+                attempt += 1
+                await asyncio.sleep(backoff(attempt, None))
+                continue
             wait = mint_wait(res)
             if wait is not None and attempt < 3:
                 attempt += 1
@@ -152,7 +161,8 @@ class AsyncBucket:
         body is never retried either: it has already been read once.
         """
         streaming = content is not None and not isinstance(content, (bytes, str))
-        attempts = RETRY_ATTEMPTS if not streaming and method in RETRIABLE_METHODS else 1
+        retriable = not streaming and method in RETRIABLE_METHODS and not is_conditional(headers)
+        attempts = RETRY_ATTEMPTS if retriable else 1
         refreshed = False
         attempt = 0
         while True:
@@ -162,19 +172,23 @@ class AsyncBucket:
             request = self._client.build_request(method, url, headers=signed, content=content)
             try:
                 res = await self._client.send(request, stream=stream)
+            except httpx.LocalProtocolError:
+                raise refused_to_send() from None
             except httpx.TransportError as e:
                 if attempt >= attempts:
                     raise transport_error(e) from e
                 await asyncio.sleep(backoff(attempt, None))
                 continue
-            if res.status_code == 403 and not refreshed and not streaming:
+            if res.status_code == 403:
                 # A HEAD carries no body to name the reason, so a credential that has visibly run out
-                # counts as the same finding: re-mint once and ask again.
+                # counts as the same finding: re-mint once and ask again. A streamed body cannot be
+                # sent again, but the next request still gets a fresh credential.
                 await res.aread()
                 if self._core._credential_expired() or CREDENTIAL_REJECTED.search(res.text):
-                    refreshed = True
                     self._core._creds.invalidate()
-                    continue
+                    if not refreshed and not streaming:
+                        refreshed = True
+                        continue
                 return res
             if attempt < attempts and (res.status_code == 429 or res.status_code >= 500):
                 await res.aclose()
@@ -306,7 +320,9 @@ class AsyncBucket:
         try:
             data: _body.AsyncData = resolved.data
             length = resolved.size
-            ctype = content_type or resolved.content_type or "application/octet-stream"
+            ctype = safe_content_type(content_type or resolved.content_type or "application/octet-stream")
+            if if_unchanged is not None:
+                check_etag(if_unchanged)
 
             if length is None and size is not None:
                 length = parse_size(size, "size")
@@ -347,7 +363,9 @@ class AsyncBucket:
             if if_unchanged is not None:
                 headers["if-match"] = if_unchanged
 
-            res = await self._fetch("PUT", path, headers=headers, content=data if length > 0 else b"")
+            res = await self._fetch(
+                "PUT", path, headers=headers, content=_body.aexact(data, length) if length > 0 else b""
+            )
             if res.status_code == 412:
                 if allow_overwrite is False:
                     existing = await self._head(path)
@@ -633,7 +651,11 @@ class AsyncBucket:
     ) -> List[MultipartUpload]:
         """List plus abort, for a cron. Returns what it aborted."""
         cutoff = time.time() - parse_duration(older_than, "older_than")
-        stale = [u for u in await self.list_multipart_uploads(prefix=prefix) if u.initiated_at.timestamp() <= cutoff]
+        stale = [
+            u
+            for u in await self.list_multipart_uploads(prefix=prefix)
+            if u.initiated_at and u.initiated_at.timestamp() <= cutoff
+        ]
         for u in stale:
             await self._abort_multipart(u.path, u.upload_id)
         return stale
@@ -663,7 +685,7 @@ class AsyncBucket:
                 raise BlobError("not_found", f"{src} not found")
             visibility = self._core._visibility()
             headers["x-amz-metadata-directive"] = "REPLACE"
-            headers["content-type"] = content_type or source.content_type
+            headers["content-type"] = source.content_type if content_type is None else safe_content_type(content_type)
             if cache is not None:
                 headers["cache-control"] = cache_control(cache, visibility)
             else:

@@ -1,20 +1,21 @@
 """What the sync and async buckets share: everything but the I/O."""
 
 import asyncio
+import math
 import random
 import re
 import threading
 import time
 import weakref
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, urlsplit
 
 import httpx
 
-from upstash_blob._keys import blocks, decode_entities, encode_key, escape_xml, presignable_key, tag
+from upstash_blob._keys import blocks, decode_entities, encode_key, escape_xml, presignable_key, tag, uri_encode
 from upstash_blob._sigv4 import canonical_query, sign_headers
 from upstash_blob._telemetry import telemetry_headers
 from upstash_blob._token import DOMAIN_SUFFIX, decode_token
@@ -54,8 +55,9 @@ DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 @dataclass(frozen=True)
 class Credentials:
     access_key_id: str
-    secret_access_key: str
-    session_token: str
+    # Kept out of repr: an error reporter that captures frame locals would otherwise record them.
+    secret_access_key: str = field(repr=False)
+    session_token: str = field(repr=False)
     endpoint: str
     bucket: str
     region: str
@@ -68,11 +70,22 @@ class Credentials:
 def _r2_https(url: Any) -> bool:
     if not isinstance(url, str):
         return False
+    # urlsplit reads "https://evil.example\\@acc.r2..." as an R2 host where a browser reads evil.example,
+    # so anything that could carry userinfo is refused rather than parsed.
+    if "\\" in url or "@" in url or any(ord(c) < 0x21 for c in url):
+        return False
     try:
         parts = urlsplit(url)
     except ValueError:
         return False
     return parts.scheme == "https" and (parts.hostname or "").endswith(".r2.cloudflarestorage.com")
+
+
+def normalized_host(url: str) -> str:
+    """The Host header httpx sends for this url: lowercased, with the default port dropped."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    return host if parts.port in (None, 443) else f"{host}:{parts.port}"
 
 
 def agent_headers(token: str, telemetry: bool) -> Dict[str, str]:
@@ -134,6 +147,9 @@ class CredentialCache:
     def __init__(self) -> None:
         self._current: Optional[Credentials] = None
         self._refresh_at = 0.0
+        self._mint_lock = threading.Lock()
+        # Guards _alocks only, never a mint: the event loop takes it too, so it must never be held
+        # across network I/O.
         self._lock = threading.Lock()
         self._alocks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = weakref.WeakKeyDictionary()
 
@@ -160,7 +176,7 @@ class CredentialCache:
         creds = self.fresh()
         if creds is not None:
             return creds
-        with self._lock:
+        with self._mint_lock:
             creds = self.fresh()
             if creds is not None:
                 return creds
@@ -255,15 +271,19 @@ def presigned_from(res: httpx.Response) -> Tuple[str, datetime]:
         )
     # The url is handed to whoever the caller gives it to; refuse anything but R2 over https.
     url, expires_at = body.get("url"), body.get("expiresAt")
+    unexpected = BlobError("request_failed", "the signing service answered with an unexpected url", status=502)
     if (
         not isinstance(url, str)
         or not _r2_https(url)
         or isinstance(expires_at, bool)
         or not isinstance(expires_at, (int, float))
-        or expires_at != expires_at
+        or not math.isfinite(expires_at)
     ):
-        raise BlobError("request_failed", "the signing service answered with an unexpected url", status=502)
-    return url, datetime.fromtimestamp(expires_at, timezone.utc)
+        raise unexpected
+    try:
+        return url, datetime.fromtimestamp(expires_at, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise unexpected from None
 
 
 # ---------------------------------------------------------------- responses
@@ -300,13 +320,29 @@ def _http_date(value: Optional[str]) -> datetime:
     return datetime.now(timezone.utc)
 
 
-def iso_date(value: Optional[str]) -> datetime:
-    if value:
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-        except ValueError:
-            pass
-    return datetime.fromtimestamp(0, timezone.utc)
+_ISO = re.compile(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?", re.ASCII)
+
+
+def iso_date(value: Optional[str]) -> Optional[datetime]:
+    """
+    By hand rather than fromisoformat, which on 3.10 refuses any fraction that is not 3 or 6
+    digits. None when it does not parse.
+    """
+    m = _ISO.fullmatch((value or "").strip())
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) for g in m.groups()[:6])
+    micros = int((m.group(7) or "0")[:6].ljust(6, "0"))
+    tz = timezone.utc
+    zone = m.group(8)
+    if zone and zone != "Z":
+        sign = -1 if zone[0] == "-" else 1
+        hh, mm = int(zone[1:3]), int(zone[-2:])
+        tz = timezone(sign * timedelta(hours=hh, minutes=mm))
+    try:
+        return datetime(y, mo, d, h, mi, s, micros, tz).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def head_from_headers(h: httpx.Headers) -> Head:
@@ -352,6 +388,26 @@ def error_from_body(status: int, xml: str) -> BlobError:
     return BlobError("request_failed", f"R2 responded {status}{detail}", status=502 if status >= 500 else status)
 
 
+def is_conditional(headers: Optional[Mapping[str, str]]) -> bool:
+    """A conditional write sent twice can refuse its own first attempt, so it is sent once."""
+    return bool(headers) and any(k.lower() in ("if-match", "if-none-match") for k in headers or {})
+
+
+def refused_to_send() -> BlobError:
+    """httpx would not put the request on the wire: a header or a body length the SDK let through."""
+    # Not str(e): h11 quotes the header value it refused.
+    return BlobError("invalid_input", "the request could not be sent: a header value or the body length is invalid")
+
+
+_ETAG = re.compile(r'(?:W/)?"[\x21\x23-\x7e]*"|[\x21-\x7e]+', re.ASCII)
+
+
+def check_etag(etag: str) -> str:
+    if not isinstance(etag, str) or not _ETAG.fullmatch(etag):
+        raise BlobError("invalid_input", "if_unchanged: expected an etag")
+    return etag
+
+
 def transport_error(e: Exception, what: str = "storage") -> BlobError:
     return BlobError("request_failed", f"could not reach {what}: {type(e).__name__}", status=502)
 
@@ -368,7 +424,8 @@ def parse_list(
         if key is None:
             continue
         etag = decode_entities(tag(b, "ETag") or "")
-        blobs.append(blob(decode_entities(key), int(tag(b, "Size") or 0), etag, iso_date(tag(b, "LastModified"))))
+        modified = iso_date(tag(b, "LastModified")) or datetime.fromtimestamp(0, timezone.utc)
+        blobs.append(blob(decode_entities(key), int(tag(b, "Size") or 0), etag, modified))
     nxt = tag(xml, "NextContinuationToken")
     cursor = decode_entities(nxt) if tag(xml, "IsTruncated") == "true" and nxt else None
     return blobs, cursor
@@ -447,6 +504,8 @@ class BucketCore:
     def __init__(self, token: str, cache: Optional[CacheOption], enable_telemetry: bool) -> None:
         if not isinstance(token, str) or not token:
             raise TypeError("Bucket(token): token is required")
+        # A token read from a secret file often ends in a newline, which no header can carry.
+        token = token.strip()
         decoded = decode_token(token)
         self._token = token
         self._bucket_id = decoded.bucket_id
@@ -466,7 +525,9 @@ class BucketCore:
     def _public_url(self, path: str) -> Optional[str]:
         if self._visibility() == "private":
             return None
-        return f"https://{self._hostname}/{encode_key(path)}"
+        # Not encode_key: a listed key is whatever storage holds, and a "." segment in one must not
+        # break the page it is on. Paths a caller passes in are checked where they are taken.
+        return f"https://{self._hostname}/{'/'.join(uri_encode(s) for s in path.split('/'))}"
 
     def _blob(self, path: str, size: int, etag: str, uploaded_at: datetime) -> BlobObject:
         url = self._public_url(path)
@@ -499,7 +560,7 @@ class BucketCore:
             session_token=creds.session_token,
             region=creds.region,
             method=method,
-            host=parts.netloc,
+            host=normalized_host(creds.endpoint),
             path=url_path,
             query=query,
             headers=headers,
