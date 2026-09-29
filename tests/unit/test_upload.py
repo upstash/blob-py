@@ -56,10 +56,11 @@ class Client:
         route: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         request: Any = "req",
+        native: Optional[type] = None,
     ) -> Any:
         raw = body if isinstance(body, bytes) else json.dumps(body).encode() if body is not None else b""
         hdrs = {"content-type": "application/json", **(headers or {})}
-        res = h.handle(method, request=request, route=route, body=raw, headers=hdrs)
+        res = h.handle(method, request=request, route=route, body=raw, headers=hdrs, native=native)
         return await res if inspect.isawaitable(res) else res
 
     async def post(self, h: Handler, body: Any, route: Optional[str] = None, **kw: Any) -> Any:
@@ -495,6 +496,10 @@ async def test_context_refusals(client: Client) -> None:
         await client.begin(client.handler(context=boom, on_before_upload=before()))
 
 
+class NativeResponse:
+    pass
+
+
 async def test_on_error_sees_refusals_and_may_replace_them(client: Client) -> None:
     seen: List[UploadErrorArgs] = []
 
@@ -503,7 +508,9 @@ async def test_on_error_sees_refusals_and_may_replace_them(client: Client) -> No
         if a.path == "swap":
             return BlobError("conflict", "taken")
         if a.path == "native":
-            return "a framework response"
+            return NativeResponse()
+        if a.path == "event-id":
+            return "3f2a9c"  # what sentry_sdk.capture_exception returns: not an answer
         return None
 
     h = client.handler(
@@ -523,12 +530,18 @@ async def test_on_error_sees_refusals_and_may_replace_them(client: Client) -> No
     status, body = await client.begin(refuse_after, input="swap")
     assert (status, body["code"]) == (409, "conflict")
     assert seen[-1].path == "swap"
-    assert (
+    assert isinstance(
         await client.call(
-            refuse_after, body={"phase": "begin", "file": {"name": "a", "type": "", "size": 1}, "input": "native"}
-        )
-        == "a framework response"
+            refuse_after,
+            body={"phase": "begin", "file": {"name": "a", "type": "", "size": 1}, "input": "native"},
+            native=NativeResponse,
+        ),
+        NativeResponse,
     )
+    status, body = await client.begin(refuse_after, input="native")  # a handle() that named no native type
+    assert (status, body["code"]) == (400, "invalid_input")
+    status, body = await client.begin(refuse_after, input="event-id")
+    assert (status, body["code"]) == (400, "invalid_input")
     status, body = await client.begin(client.handler(on_before_upload=before(), on_error=on_error), route="x")
     assert status == 404 and seen[-1].route == "x" and seen[-1].ctx is None
 
@@ -595,3 +608,16 @@ async def test_async_handler_awaits_async_callbacks(fake: Fake) -> None:
 
     c = Client(fake, "async")
     assert (await c.begin(c.handler(context=ctx, on_before_upload=decide)))[1]["path"] == "u/x"
+
+
+async def test_context_never_runs_for_a_non_json_body(client: Client) -> None:
+    ran: List[Any] = []
+    h = client.handler(context=lambda req: ran.append(req), on_before_upload=before())
+    status, _ = await client.post(h, {"phase": "begin"}, headers={"content-type": "text/plain"})
+    assert status == 415 and ran == []
+
+
+async def test_deeply_nested_json_is_a_refusal(client: Client) -> None:
+    h = client.handler(on_before_upload=before())
+    status, body = await client.post(h, b"[" * 200_000 + b"]" * 200_000)
+    assert (status, body["code"]) == (400, "invalid_input")

@@ -13,6 +13,17 @@ from upstash_blob._upload import MAX_BODY, UploadResponse
 from upstash_blob._upload_sync import UploadHandler
 
 
+def _body(req: Any) -> bytes:
+    # Cached, so a before_request hook that read the body first leaves it readable here.
+    if req.content_length is not None and req.content_length <= MAX_BODY:
+        return bytes(req.get_data(cache=True))
+    # Over the cap, or of unknown length: one byte past the cap is all the handler needs to refuse it.
+    body = req.stream.read(MAX_BODY + 1)
+    if not body and req.content_length:
+        return bytes(MAX_BODY + 1)
+    return bytes(body)
+
+
 def upload_view(uploads: UploadHandler, name: str = "upstash_blob_upload") -> Callable[[], Any]:
     """
     A view for GET and POST. ``request`` in every callback is Flask's request. Two handlers on one
@@ -27,9 +38,9 @@ def upload_view(uploads: UploadHandler, name: str = "upstash_blob_upload") -> Ca
             req.method,
             request=req,
             route=req.args.get("route"),
-            # One byte past the cap, which the handler refuses: nothing longer is ever buffered.
-            body=req.stream.read(MAX_BODY + 1) if req.method == "POST" else b"",
+            body=_body(req) if req.method == "POST" else b"",
             headers=req.headers,
+            native=Response,
         )
         if isinstance(res, UploadResponse):
             return Response(res.body, status=res.status, headers=res.headers)

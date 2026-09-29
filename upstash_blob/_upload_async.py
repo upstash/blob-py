@@ -22,6 +22,7 @@ from upstash_blob._upload import (
     check_decided,
     check_grant,
     check_metadata,
+    check_request,
     complete_args,
     default_answer,
     end_json,
@@ -33,6 +34,7 @@ from upstash_blob._upload import (
     json_response,
     limits_response,
     logger,
+    mapped_answer,
     mount_routes,
     narrow,
     not_allowed,
@@ -148,9 +150,10 @@ class AsyncUploadHandler:
         route: Optional[str] = None,
         body: bytes = b"",
         headers: Optional[Mapping[str, str]] = None,
+        native: Optional[type] = None,
     ) -> Any:
         """
-        Serves one request from any framework. Returns an ``UploadResponse``, or whatever
+        Serves one request from any framework. Returns an ``UploadResponse``, or the response
         ``on_error`` returned in its place.
 
         :param method: GET serves the route's limits; POST runs the upload protocol.
@@ -158,24 +161,29 @@ class AsyncUploadHandler:
         :param route: The ``route`` query parameter.
         :param body: The raw POST body.
         :param headers: The request headers; ``content-type`` and ``if-none-match`` are read.
+        :param native: The framework's response class, which ``on_error`` may return to answer with.
         """
         verb = method.upper()
         if verb not in ("GET", "POST"):
             return not_allowed()
         name, m = pick_route(self._table, self._sole, route)
         if m is None:
-            return await self._not_found(name, request)
+            return await self._not_found(name, request, native)
         if verb == "GET":
             return limits_response(m, header(headers, "if-none-match"))
+        details = Details()
+        try:
+            check_request(body, header(headers, "content-type"))
+        except Exception as e:
+            return await self._answer(e, m, None, request, details, native)
         ctx = None
         if self._context is not None:
             try:
                 ctx = await _settle(self._context(request))
             except Exception as e:
-                return await self._answer(e, m, None, request, Details())
-        details = Details()
+                return await self._answer(e, m, None, request, details, native)
         try:
-            data = read_body(body, header(headers, "content-type"))
+            data = read_body(body)
             phase = data["phase"]
             if phase == "begin":
                 return json_response(await self._begin(m, ctx, request, data, details))
@@ -187,26 +195,26 @@ class AsyncUploadHandler:
                 return json_response(await self._cancel(m, data, details))
             raise BlobError("invalid_input", f"unknown phase {phase}")
         except Exception as e:
-            return await self._answer(e, m, ctx, request, details)
+            return await self._answer(e, m, ctx, request, details, native)
 
-    async def _not_found(self, name: str, request: Any) -> Any:
+    async def _not_found(self, name: str, request: Any, native: Optional[type]) -> Any:
         # Never the names it does mount, and never a 500: an unknown route is a 404 like any other.
         error = BlobError("not_found", "unknown upload route")
         if self._on_error is not None:
-            mapped = await _settle(self._on_error(error_args(None, name, request, error, Details())))
-            if isinstance(mapped, BlobError):
-                return error_response(mapped)
-            if mapped is not None:
-                return mapped
+            answer = mapped_answer(
+                await _settle(self._on_error(error_args(None, name, request, error, Details()))), native
+            )
+            if answer is not None:
+                return answer
         return error_response(error)
 
-    async def _answer(self, e: Exception, m: Mounted, ctx: Any, request: Any, d: Details) -> Any:
+    async def _answer(
+        self, e: Exception, m: Mounted, ctx: Any, request: Any, d: Details, native: Optional[type]
+    ) -> Any:
         if m.on_error is not None:
-            mapped = await _settle(m.on_error(error_args(ctx, m.name, request, e, d)))
-            if isinstance(mapped, BlobError):
-                return error_response(mapped)
-            if mapped is not None:
-                return mapped
+            answer = mapped_answer(await _settle(m.on_error(error_args(ctx, m.name, request, e, d))), native)
+            if answer is not None:
+                return answer
         return default_answer(e)
 
     # ------------------------------------------------------------- phases

@@ -8,7 +8,7 @@ async one (under ASGI).
 
 from typing import Any, Callable, Union
 
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest, HttpResponse, HttpResponseBase
 
 from upstash_blob._upload import UploadResponse
 from upstash_blob._upload_async import AsyncUploadHandler
@@ -46,6 +46,7 @@ def upload_view(uploads: Union[UploadHandler, AsyncUploadHandler]) -> Callable[.
                     route=request.GET.get("route"),
                     body=_body(request),
                     headers=request.headers,
+                    native=HttpResponseBase,
                 )
             )
 
@@ -61,6 +62,7 @@ def upload_view(uploads: Union[UploadHandler, AsyncUploadHandler]) -> Callable[.
                     route=request.GET.get("route"),
                     body=_body(request),
                     headers=request.headers,
+                    native=HttpResponseBase,
                 )
             )
 

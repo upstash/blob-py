@@ -57,7 +57,7 @@ def test_fastapi(fake: Fake) -> None:
     def on_error(a: UploadErrorArgs) -> Any:
         if a.route == "teapot":
             return JSONResponse({"custom": True}, status_code=418)
-        return None
+        return "event-id"
 
     uploads = AsyncUploadHandler(
         bucket=async_bucket(fake),
@@ -107,6 +107,12 @@ def test_flask(fake: Fake) -> None:
         routes={"doc": _route()},
     )
     app = flask.Flask(__name__)
+
+    # An extension that reads the body first must not leave the handler an empty one.
+    @app.before_request
+    def read_first() -> None:
+        flask.request.get_json(silent=True)
+
     app.add_url_rule("/api/upload", view_func=upload_view(uploads), methods=["GET", "POST"])
     client = app.test_client()
 
@@ -121,6 +127,9 @@ def test_flask(fake: Fake) -> None:
     res = client.post("/api/upload?route=doc", json=end_of(begun))
     assert res.status_code == 200 and res.get_json()["blob"]["size"] == 5
     assert client.post("/api/upload?route=nope", json=BEGIN).status_code == 404
+    big = b"{" + b" " * 2_000_000 + b"}"
+    res = client.post("/api/upload?route=doc", data=big, content_type="application/json")
+    assert res.status_code == 413
 
 
 def test_django(fake: Fake) -> None:

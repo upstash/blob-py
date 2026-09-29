@@ -344,7 +344,8 @@ def header(headers: Optional[Mapping[str, str]], name: str) -> Optional[str]:
     return value
 
 
-def read_body(body: bytes, content_type: Optional[str]) -> Dict[str, Any]:
+def check_request(body: bytes, content_type: Optional[str]) -> None:
+    """Runs before ``context``: what it refuses never reaches a callback."""
     # The browser client always sends JSON. Refusing anything else means a cross-site form or a
     # no-cors fetch, which cannot set this type without a CORS preflight, never reaches a callback
     # with the visitor's cookies.
@@ -352,13 +353,28 @@ def read_body(body: bytes, content_type: Optional[str]) -> Dict[str, Any]:
         raise BlobError("invalid_input", "expected a JSON body (content-type: application/json)", status=415)
     if len(body) > MAX_BODY:
         raise BlobError("too_large", "the request body is too large for an upload route")
+
+
+def read_body(body: bytes) -> Dict[str, Any]:
     try:
         parsed = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         parsed = None
     if not isinstance(parsed, dict) or not isinstance(parsed.get("phase"), str):
         raise BlobError("invalid_input", "expected a JSON body with a phase")
     return parsed
+
+
+def mapped_answer(mapped: Any, native: Optional[type]) -> Any:
+    """
+    What on_error returned, if it is an answer: a BlobError, an UploadResponse, or the framework's
+    own response. Anything else (a logger's event id, say) leaves the default answer alone.
+    """
+    if isinstance(mapped, BlobError):
+        return error_response(mapped)
+    if isinstance(mapped, UploadResponse) or (native is not None and isinstance(mapped, native)):
+        return mapped
+    return None
 
 
 def _int(value: Any) -> Optional[int]:

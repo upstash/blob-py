@@ -39,6 +39,7 @@ def upload_view(uploads: AsyncUploadHandler) -> Callable[[Request], Awaitable[An
             route=request.query_params.get("route"),
             body=await _read(request) if request.method == "POST" else b"",
             headers=request.headers,
+            native=Response,
         )
         if isinstance(res, UploadResponse):
             return Response(res.body, res.status, headers=res.headers)
