@@ -1,0 +1,124 @@
+# upstash-blob
+
+Python SDK for [Upstash Blob](https://upstash.com/docs/blob). Sync and async, one dependency (`httpx`).
+
+```bash
+pip install upstash-blob
+```
+
+## Usage
+
+```python
+from pathlib import Path
+
+from upstash_blob import Bucket
+
+bucket = Bucket.from_env()  # reads UPSTASH_BLOB_TOKEN, or Bucket(token)
+
+blob = bucket.put("avatars/me.png", Path("me.png"))
+blob.url  # None on a private bucket
+blob.etag
+
+bucket.get("avatars/me.png").content  # record + bytes
+bucket.info("avatars/me.png")  # same record, no bytes
+bucket.exists("avatars/me.png")  # False instead of a raise
+bucket.list(prefix="avatars/", limit=100)  # ListPage(blobs, cursor)
+bucket.copy("tmp/9f3c", "avatars/7.png")
+bucket.move("tmp/9f3c", "avatars/7.png", content_type="image/png")
+bucket.delete("a.png")  # or ["a.png", "b.png"], or prefix="tmp/"
+bucket.update_json("u/7.json", lambda prev: {**(prev or {}), "theme": "dark"})
+
+with bucket.stream("videos/intro.mp4") as video:
+    for chunk in video.iter_bytes():
+        ...
+```
+
+`AsyncBucket` has the same methods, awaited, and also takes async iterables as a body:
+
+```python
+from upstash_blob import AsyncBucket
+
+async with AsyncBucket.from_env() as bucket:
+    await bucket.put("report.pdf", data, content_type="application/pdf")
+```
+
+- `put` takes bytes, str, a `pathlib.Path`, a binary file object, or an iterable of bytes. The content
+  type is guessed from a file name, else `application/octet-stream`. An iterable of unknown length
+  needs `size=` or `max_size=`.
+- `content_types=["image/*"]` checks the declared type and the file's first bytes; `max_size="20mb"`
+  refuses anything larger, while streaming too.
+- A body over 16 MB goes up as multipart; `multipart="100mb" | True | False` moves the line.
+  `allow_overwrite=False` and `if_unchanged=etag` are single-PUT only.
+- `get` and `info` raise `not_found` rather than returning None; `list` returns keys, sizes, etags
+  and urls, without metadata. `cursor` is set only while more remains.
+- `update_json` is a compare-and-set loop, retried on conflict up to `max_attempts` times (default 6).
+- `copy` and `move` take `content_type`, `cache`, `metadata`; whatever is not given is carried over
+  from the source. `move` is a copy plus a delete: a failed delete raises `move_left_a_copy`.
+- `delete(prefix="")` needs `all=True`. A partial list delete raises `partial_delete`.
+- Metadata is printable ASCII; anything else is refused with `invalid_input`.
+- `cache` takes `"immutable"`, `"revalidate"`, `"no-store"`, a duration (`"15m"`, `3600`,
+  `timedelta`), or a verbatim header. Sizes are decimal (`"2mb"` is 2,000,000 bytes).
+
+### Signed URLs
+
+```python
+read = bucket.signed_read_url("private/report.pdf", download_as="report.pdf")
+upload = bucket.signed_upload_url("u/7/report.pdf", content_type="application/pdf", size=size)
+httpx.put(upload.url, headers=upload.headers, content=body)
+```
+
+Links are signed by Upstash and live at most 10 minutes (read default: 5); `expires_at` is the answer
+per link. `headers` on an upload URL are pinned into the signature. Whether a bucket is private is
+decided in the console: a private bucket has no `url` on any blob and `public_url()` is None.
+
+### Incomplete uploads
+
+A multipart upload that was never finished is invisible to `list()` and blocks bucket deletion. The
+SDK aborts the ones it starts; sweep the rest from a cron:
+
+```python
+bucket.abort_stale_multipart_uploads(older_than="1d", prefix="uploads/")
+```
+
+### The S3 escape hatch
+
+```python
+cfg = bucket.s3()
+s3 = boto3.client("s3", **cfg.client_kwargs())
+s3.list_objects_v2(Bucket=cfg.bucket)
+```
+
+The credentials are short-lived; call `s3()` again after `cfg.expires_at`.
+
+## Errors
+
+Everything raises a `BlobError` with a `code` from a closed list, a `status`, and a printable
+message. `e.to_dict()` is the JSON shape the TypeScript SDK's browser half decodes.
+
+```python
+try:
+    bucket.put(path, body, max_size="5mb")
+except BlobError as e:
+    if e.code == "too_large":
+        ...
+```
+
+## Telemetry
+
+Credential and signing requests carry the SDK version, Python version, and platform. Set
+`UPSTASH_DISABLE_TELEMETRY` or pass `enable_telemetry=False`.
+
+## Development
+
+```bash
+uv sync
+uv run ruff check . && uv run ruff format --check . && uv run mypy upstash_blob
+uv run pytest tests/unit
+```
+
+`uv run pytest tests/live` runs against real buckets and needs `UPSTASH_BLOB_PUBLIC_TOKEN` and
+`UPSTASH_BLOB_PRIVATE_TOKEN` (a `.env` file works).
+
+## License
+
+[MIT](./LICENSE)
