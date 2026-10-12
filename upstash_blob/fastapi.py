@@ -15,7 +15,11 @@ from upstash_blob._upload_async import AsyncUploadHandler
 
 
 async def _read(request: Request) -> bytes:
-    # Stops one byte past the cap, which the handler refuses: nothing longer is ever buffered.
+    # A declared length within the cap is read through Starlette's cache, so a callback can read the
+    # body again; anything else stops one byte past the cap, which the handler refuses.
+    length = request.headers.get("content-length", "")
+    if length.isascii() and length.isdigit() and int(length) <= MAX_BODY:
+        return await request.body()
     body = bytearray()
     async for chunk in request.stream():
         body += chunk

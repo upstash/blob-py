@@ -400,9 +400,18 @@ def _int(value: Any) -> Optional[int]:
     return None
 
 
+_MAX_SAFE_INTEGER = 2**53 - 1
+"""The largest size the browser can declare exactly, and a float can hold for the size math."""
+
+
 def read_file(raw: Any) -> FileInfo:
     size = _int(raw.get("size")) if isinstance(raw, dict) else None
-    if not isinstance(raw, dict) or not isinstance(raw.get("name"), str) or size is None or size < 0:
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(raw.get("name"), str)
+        or size is None
+        or not 0 <= size <= _MAX_SAFE_INTEGER
+    ):
         raise BlobError("invalid_input", "file must be { name, type, size }")
     declared = raw.get("type")
     bare = declared.lower().split(";", 1)[0].strip() if isinstance(declared, str) else ""
@@ -545,7 +554,11 @@ def sign_grant(g: Grant, key: str) -> str:
 
 def verify_grant(token: str, key: str) -> Optional[Grant]:
     body, dot, sig = token.partition(".")
-    if not dot or not hmac.compare_digest(sig.encode(), _mac(body, key).encode()):
+    try:
+        if not dot or not hmac.compare_digest(sig.encode(), _mac(body, key).encode()):
+            return None
+    except UnicodeEncodeError:
+        # A lone surrogate is not a token this SDK minted.
         return None
     try:
         p = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))

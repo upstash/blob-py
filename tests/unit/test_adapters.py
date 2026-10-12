@@ -50,7 +50,9 @@ def test_fastapi(fake: Fake) -> None:
             raise fastapi.HTTPException(401, "sign in")
         return "u1"
 
-    def decide(a: BeforeUploadArgs) -> BeforeUploadResult:
+    async def decide(a: BeforeUploadArgs) -> BeforeUploadResult:
+        # The adapter leaves the body readable for callbacks, as the Django and Flask ones do.
+        assert (await a.request.json())["phase"] == "begin"
         seen.append(a.request)
         return BeforeUploadResult(path=f"{a.ctx}/{a.file.name}")
 

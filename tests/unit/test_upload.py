@@ -363,6 +363,22 @@ async def test_a_traversing_path_is_the_clients_bad_input(client: Client, fake: 
     assert not fake.presigns
 
 
+async def test_an_impossible_size_is_refused_before_anything_is_created(client: Client, fake: Fake) -> None:
+    for kw in ({}, {"max_size": "1MB"}):
+        h = client.handler(on_before_upload=before(), **kw)
+        status, body = await client.post(h, {"phase": "begin", "file": {"name": "a", "type": "", "size": 10**400}})
+        assert (status, body["code"]) == (400, "invalid_input")
+    assert not fake.uploads and not fake.presigns
+
+
+async def test_a_token_that_is_not_text_is_forbidden(client: Client) -> None:
+    h = client.handler(on_before_upload=before())
+    for token in ("abc\ud800.def", "abc.d\ud800ef"):
+        for phase in ("parts", "end", "cancel"):
+            status, body = await client.post(h, {"phase": phase, "completionToken": token})
+            assert (status, body["code"]) == (403, "forbidden")
+
+
 async def test_binary_limits_read_as_exact_bytes(client: Client) -> None:
     h = client.handler(max_size="32MiB", on_before_upload=before())
     status, body = await client.begin(h, size=32 * MIB + 1)
