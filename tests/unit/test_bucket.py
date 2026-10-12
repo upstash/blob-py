@@ -240,6 +240,21 @@ class TestStream:
             pass
         assert e.value.code == "not_found"
 
+    def test_reads_ask_for_the_stored_bytes(self, fake: Fake, bucket: Bucket) -> None:
+        bucket.put("s.bin", b"abc")
+        fake.calls.clear()
+        bucket.get("s.bin")
+        bucket.info("s.bin")
+        with bucket.stream("s.bin"):
+            pass
+        reads = [c for c in fake.r2_calls() if c.method in ("GET", "HEAD")]
+        assert len(reads) == 3 and all(c.headers["accept-encoding"] == "identity" for c in reads)
+
+    def test_a_read_without_a_length_is_refused(self, fake: Fake, bucket: Bucket) -> None:
+        bucket.put("s.bin", b"abc")
+        fake.intercept = lambda r: httpx.Response(200, headers={"etag": '"e"'}) if r.method == "HEAD" else None
+        assert code_of(bucket.info, "s.bin") == "request_failed"
+
 
 class TestList:
     def test_pages_with_a_cursor(self, fake: Fake, bucket: Bucket) -> None:

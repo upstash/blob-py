@@ -5,7 +5,7 @@ from upstash_blob._units import Size, format_bytes, parse_size
 from upstash_blob.errors import BlobError
 
 MULTIPART_THRESHOLD = 16_000_000
-"""Decimal. Under it a body goes up as one PUT, over it in parts."""
+"""Decimal, 16 MB. Under it a body goes up as one PUT, over it in parts."""
 
 SINGLE_PUT_MAX = 5 * 1024 * 1024 * 1024
 """R2 refuses a single PUT larger than this, so past it there is no choice but parts."""

@@ -5,10 +5,14 @@ from typing import Dict, Literal, Optional, Union
 
 from upstash_blob.errors import BlobError
 
-# Sizes are decimal ('2mb' = 2,000,000), matching how storage is billed. The only binary math in
-# the SDK is multipart part sizing, because R2's part floor is 5 MiB.
+# Sizes always count bytes. Decimal units match storage billing ('2MB' = 2,000,000); explicit
+# binary units match file limits ('2MiB' = 2,097,152). Unit names ignore case.
 Size = Union[int, str]
-"""Bytes as an int, or a string like ``'2mb'``, ``'500kb'``, ``'5gb'``. Decimal units."""
+"""
+Bytes as an int, or a string with a unit. Decimal units count powers of 1000 and binary units
+powers of 1024: ``'32MB'`` is 32,000,000 bytes, so ``max_size="32MB"`` refuses a 32 MiB
+(33,554,432-byte) file. For a 32 MiB limit pass ``'32MiB'`` or ``32 * 1024 * 1024``.
+"""
 
 Duration = Union[int, float, str, timedelta]
 """Seconds as a number, a ``timedelta``, or a string like ``'15m'``, ``'2h'``, ``'7d'``."""
@@ -27,7 +31,17 @@ The ``Cache-Control`` an object is stored with. Written once, at upload, and ser
 ``private`` replaces ``public`` on a private bucket.
 """
 
-_SIZE_UNITS: Dict[str, int] = {"b": 1, "kb": 10**3, "mb": 10**6, "gb": 10**9, "tb": 10**12}
+_SIZE_UNITS: Dict[str, int] = {
+    "b": 1,
+    "kb": 10**3,
+    "mb": 10**6,
+    "gb": 10**9,
+    "tb": 10**12,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+    "tib": 1024**4,
+}
 
 _DURATION_UNITS: Dict[str, int] = {
     "ms": 1,
@@ -62,11 +76,11 @@ def parse_size(value: Size, what: str = "size") -> int:
         raise TypeError(f"{what}: expected bytes or a string like '2mb', got {value!r}")
     m = _AMOUNT.fullmatch(value)
     if not m:
-        raise ValueError(f"{what}: cannot parse {value!r} (try '2mb', '500kb', '5gb')")
+        raise ValueError(f"{what}: cannot parse {value!r} (try '2MB', '32MiB', '500KB')")
     unit = (m.group(2) or "b").lower()
     mult = _SIZE_UNITS.get(unit)
     if mult is None:
-        raise ValueError(f"{what}: unknown unit {m.group(2)!r} in {value!r} (b, kb, mb, gb, tb)")
+        raise ValueError(f"{what}: unknown unit {m.group(2)!r} in {value!r} (b, kb, mb, gb, tb, kib, mib, gib, tib)")
     return int(float(m.group(1)) * mult)
 
 
@@ -99,9 +113,8 @@ def _round_half_up(n: float, digits: int) -> float:
 
 def format_bytes(size: float) -> str:
     """
-    Decimal, the same way sizes are parsed, so a limit written ``'2mb'`` is refused as "2 MB". An
-    exact multiple of the unit prints whole and anything else keeps a decimal; past 10 of a unit
-    the decimal is dropped.
+    Always decimal byte units, including sizes parsed from binary units. An exact multiple of the
+    unit prints whole and anything else keeps a decimal; past 10 of a unit the decimal is dropped.
     """
     if not math.isfinite(size):
         return f"{size} B"
@@ -117,6 +130,19 @@ def format_bytes(size: float) -> str:
     if n < 10:
         return f"{_round_half_up(n, 1):.1f} {units[unit]}"
     return f"{int(_round_half_up(n, 0))} {units[unit]}"
+
+
+def over_limit(size: int, limit: int) -> str:
+    """
+    The "X, over the Y limit" half of a size refusal. A limit in binary units is rarely a whole
+    decimal unit, so both sides can round to the same amount ("34 MB, over the 34 MB limit"); then
+    exact byte counts are shown instead.
+    """
+    s, lim = format_bytes(size), format_bytes(limit)
+    # One decimal is the only way two texts can name one amount: "2 MB" and "2.0 MB".
+    if s.replace(".0 ", " ") != lim.replace(".0 ", " "):
+        return f"{s}, over the {lim} limit"
+    return f"{size:,} bytes, over the {limit:,} byte limit"
 
 
 # A directive separator is what tells the two apart: a header always has one, a duration never does.

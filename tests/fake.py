@@ -123,6 +123,15 @@ class Fake:
             return xml(
                 f"<CompleteMultipartUploadResult><ETag>{esc(self.objects[key].etag)}</ETag></CompleteMultipartUploadResult>"
             )
+        elif m == "GET" and "uploadId" in q:
+            up = self.uploads.get(q["uploadId"])
+            if not up:
+                return error(404, "NoSuchUpload")
+            items = "".join(
+                f"<Part><PartNumber>{n}</PartNumber><ETag>{esc(etag_of(d))}</ETag><Size>{len(d)}</Size></Part>"
+                for n, d in sorted(up[2].items())
+            )
+            return xml(f"<ListPartsResult><IsTruncated>false</IsTruncated>{items}</ListPartsResult>")
         elif m == "DELETE" and "uploadId" in q:
             return httpx.Response(204) if self.uploads.pop(q["uploadId"], None) else error(404, "NoSuchUpload")
         elif m == "PUT" and "x-amz-copy-source" in req.headers:

@@ -34,6 +34,7 @@ from upstash_blob._core import (
     is_conditional,
     mint_wait,
     parse_list,
+    parse_parts,
     parse_uploads,
     presign_payload,
     presign_retriable,
@@ -46,7 +47,7 @@ from upstash_blob._keys import decode_entities, encode_key, meta_headers, nameab
 from upstash_blob._multipart import MultipartOption, part_count, part_size_for, wants_multipart
 from upstash_blob._sniff import check_content_type, expand_content_types
 from upstash_blob._token import AGENT_URL
-from upstash_blob._units import CacheOption, Duration, Size, cache_control, format_bytes, parse_duration, parse_size
+from upstash_blob._units import CacheOption, Duration, Size, cache_control, over_limit, parse_duration, parse_size
 from upstash_blob.errors import BlobError
 from upstash_blob.types import (
     AsyncBlobStream,
@@ -171,6 +172,10 @@ class AsyncBucket:
             attempt += 1
             creds = await self._credentials()
             url, signed = self._core._signed(creds, method, path, query, headers)
+            if method in ("GET", "HEAD"):
+                # httpx otherwise negotiates compression, which can drop Content-Length and weaken
+                # ETags; object reads need the stored representation for size checks and conditional writes.
+                signed = {**signed, "accept-encoding": "identity"}
             request = self._client.build_request(method, url, headers=signed, content=content)
             try:
                 res = await self._client.send(request, stream=stream)
@@ -210,13 +215,14 @@ class AsyncBucket:
         expires_in: float,
         headers: Optional[Mapping[str, str]] = None,
         query: Optional[Mapping[str, str]] = None,
+        part: Optional[Tuple[int, str]] = None,
     ) -> Tuple[str, datetime]:
         """
         A url for one operation on one object, signed by the agent. Never signed here: a url has to
         carry the temporary credential's session token, and R2 derives the credential's secret from
         it, so a url signed with it would hand its holder every object in the bucket.
         """
-        payload = presign_payload(method, path, expires_in, headers, query)
+        payload = presign_payload(method, path, expires_in, headers, query, part)
         attempt = 0
         while True:
             attempt += 1
@@ -270,6 +276,21 @@ class AsyncBucket:
             raise error_from_body(500, res.text)
         return decode_entities(tag(res.text, "ETag") or "")
 
+    async def _list_parts(self, path: str, upload_id: str) -> List[Tuple[int, str]]:
+        out: List[Tuple[int, str]] = []
+        marker: Optional[str] = None
+        while True:
+            query = {"uploadId": upload_id, "max-parts": "1000"}
+            if marker:
+                query["part-number-marker"] = marker
+            res = await self._fetch("GET", path, query=query)
+            if not res.is_success:
+                raise error_from_body(res.status_code, res.text)
+            parts, marker = parse_parts(res.text)
+            out.extend(parts)
+            if marker is None:
+                return out
+
     async def _abort_multipart(self, path: str, upload_id: str) -> None:
         res = await self._fetch("DELETE", path, query={"uploadId": upload_id})
         if not res.is_success and res.status_code != 404:
@@ -311,7 +332,8 @@ class AsyncBucket:
         :param content_type: Defaults to a guess from the file name, else ``application/octet-stream``.
         :param content_types: Allowed types (``image/*``, ``application/pdf``); the leading bytes
             are checked against the declared type too.
-        :param max_size: Refuse a body over this size (``'20mb'``).
+        :param max_size: Refuse a body over this size (``'20MB'``). Decimal: ``'32MB'`` is 32,000,000
+            bytes; for 32 MiB pass ``'32MiB'`` or ``32 * 1024 * 1024``.
         :param size: Declared length for an iterable whose size is not otherwise known. Without it
             the body is buffered, up to ``max_size``, to learn its length.
         :param allow_overwrite: ``False`` refuses to replace an existing object: ``already_exists``.
@@ -334,9 +356,7 @@ class AsyncBucket:
             if length is None and size is not None:
                 length = parse_size(size, "size")
             if limit is not None and length is not None and length > limit:
-                raise BlobError(
-                    "too_large", f"the body is {format_bytes(length)}, over the {format_bytes(limit)} limit"
-                )
+                raise BlobError("too_large", f"the body is {over_limit(length, limit)}")
             if length is None:
                 if limit is None:
                     raise BlobError("length_required")

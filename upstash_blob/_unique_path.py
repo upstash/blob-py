@@ -1,60 +1,29 @@
 import re
 import secrets
-import unicodedata
-from string import Formatter
-from typing import Any, Tuple
+from typing import Tuple
 
 _BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _SUFFIX_LENGTH = 8
-_MAX_STEM = 64
-_EXTENSION = re.compile(r"\.[a-z0-9]{1,8}\Z")
-_formatter = Formatter()
+_EXTENSION = re.compile(r"\.[a-z0-9]{1,8}\Z", re.IGNORECASE | re.ASCII)
 
 
 def _split_extension(name: str) -> Tuple[str, str]:
     m = _EXTENSION.search(name)
-    return (name[: m.start()], m.group(0)) if m else (name, "")
+    return (name[: m.start()], m.group(0)) if m and m.start() > 0 else (name, "")
 
 
-def _slug(stem: str) -> str:
-    # Letters and digits stay; every run of anything else becomes one '-'.
-    out = []
-    for ch in stem:
-        out.append(ch if unicodedata.category(ch)[0] in "LN" else "-")
-    slug = re.sub("-+", "-", "".join(out)).strip("-")
-    return slug[:_MAX_STEM].rstrip("-")
-
-
-def _sanitize(value: str) -> str:
-    """Everything an interpolated value can contribute: no directories, no control characters."""
-    basename = re.split(r"[/\\]", value)[-1]
-    cleaned = "".join(ch for ch in basename if unicodedata.category(ch) not in ("Cc", "Cf"))
-    cleaned = unicodedata.normalize("NFC", cleaned).lower()
-    stem, extension = _split_extension(cleaned)
-    return (_slug(stem) or "file") + extension
-
-
-def unique_path(template: str, *args: Any, **kwargs: Any) -> str:
+def unique_path(path: str) -> str:
     """
-    A path with a random suffix, built from a ``str.format`` template whose trust boundary is the
-    replacement fields: slashes in the template are structure, while a value's directories, control
-    characters and punctuation are stripped.
+    Adds a random suffix to the final filename, before its extension, so uploads never overwrite
+    each other. Everything else is kept exactly as given: case, spaces, punctuation, Unicode,
+    slashes and length. An empty final filename uses "file".
 
-    >>> unique_path("avatars/{}/{}", user.id, "My Photo.PNG")
-    'avatars/7/my-photo-4fKq2ZxA.png'
+    >>> unique_path(f"users/{user_id}/{file.name}")
+    'users/Alice_123/Q3 Report-4fKq2ZxA.pdf'
+
+    Paths are not validated here; every request refuses "." and ".." segments. Store the returned
+    path and use it unchanged for later reads and deletes.
     """
-    path = ""
-    auto = 0
-    for literal, field, spec, conversion in _formatter.parse(template):
-        path += literal.strip()
-        if field is None:
-            continue
-        if field == "":
-            field = str(auto)
-            auto += 1
-        value, _ = _formatter.get_field(field, args, kwargs)
-        value = _formatter.convert_field(value, conversion)
-        path += _sanitize(format(value, spec or ""))
     at = path.rfind("/") + 1
     stem, extension = _split_extension(path[at:])
     suffix = "".join(secrets.choice(_BASE58) for _ in range(_SUFFIX_LENGTH))

@@ -57,7 +57,10 @@ async with AsyncBucket.from_env() as bucket:
 - `delete(prefix="")` needs `all=True`. A partial list delete raises `partial_delete`.
 - Metadata is printable ASCII; anything else is refused with `invalid_input`.
 - `cache` takes `"immutable"`, `"revalidate"`, `"no-store"`, a duration (`"15m"`, `3600`,
-  `timedelta`), or a verbatim header. Sizes are decimal (`"2mb"` is 2,000,000 bytes).
+  `timedelta`), or a verbatim header.
+- Sizes count bytes. Decimal units (`KB`, `MB`, `GB`, `TB`) are powers of 1,000 and binary units
+  (`KiB`, `MiB`, `GiB`, `TiB`) powers of 1,024, case-insensitive: `"32MB"` is 32,000,000 bytes and
+  refuses a 32 MiB file, which needs `"32MiB"` or `32 * 1024 * 1024`.
 
 ### Signed URLs
 
@@ -70,6 +73,49 @@ httpx.put(upload.url, headers=upload.headers, content=body)
 Links are signed by Upstash and live at most 10 minutes (read default: 5); `expires_at` is the answer
 per link. `headers` on an upload URL are pinned into the signature. Whether a bucket is private is
 decided in the console: a private bucket has no `url` on any blob and `public_url()` is None.
+
+### Browser uploads
+
+`UploadHandler` (sync) and `AsyncUploadHandler` serve the protocol of `@upstash/blob/browser` and
+`@upstash/blob/react`, so a React app can upload straight to storage through a Python backend, with
+multipart, resume, progress and a completion callback.
+
+```python
+from upstash_blob import AsyncUploadHandler, BeforeUploadResult, UploadRoute, unique_path
+from upstash_blob.fastapi import upload_view
+
+uploads = AsyncUploadHandler(
+    context=require_user,  # its return is `ctx`; raise a 401 to refuse
+    on_before_upload=lambda a: BeforeUploadResult(path=unique_path(f"u/{a.ctx.id}/{a.file.name}")),
+    on_upload_complete=lambda a: {"url": a.url},  # reaches the browser as upload.blob.data
+    routes={
+        "avatar": UploadRoute(content_types=["image/*"], max_size="5mb"),
+        "video": UploadRoute(content_types=["video/*"], max_size="2gb"),
+    },
+)
+app.add_api_route("/api/upload", upload_view(uploads), methods=["GET", "POST"])
+```
+
+```tsx
+const upload = useUpload('avatar');  // POSTs to /api/upload?route=avatar
+```
+
+- Django: `path("api/upload", upload_view(uploads))` from `upstash_blob.django`, with either
+  handler. Flask: `app.add_url_rule("/api/upload", view_func=upload_view(uploads), methods=["GET", "POST"])`
+  from `upstash_blob.flask`, with `UploadHandler`. Anything else: `handler.handle(method, request=...,
+  route=..., body=..., headers=..., native=<framework response class>)` returns an `UploadResponse`.
+- Omit `bucket=` to use `UPSTASH_BLOB_TOKEN`. Every handler option is a default a route may replace;
+  `content_types=None` or `max_size=None` on a route clears the handler's.
+- `input=` validates what the browser sends as `input`: a pydantic model, a `TypeAdapter`, or a
+  callable that raises `ValueError`.
+- `on_upload_complete` runs at least once per upload; `upload_id` is stable across deliveries.
+  Raising deletes the object. `state` rides in a signed but readable token: an id, never a secret.
+- `on_error` sees every refusal; return a `BlobError` or a framework response to answer with it.
+- `unique_path` adds an eight-character random suffix to the final filename and keeps everything else
+  as given: `u/7/Q3 Report.pdf` becomes `u/7/Q3 Report-<random>.pdf`. A path with a `.` or `..`
+  segment is refused as `invalid_input`. Store the returned path and authorize reads by it.
+- The handler speaks the same versioned upload protocol as `@upstash/blob`'s `uploadHandler`, so
+  any release of the browser client works against it and either side can be upgraded first.
 
 ### Incomplete uploads
 

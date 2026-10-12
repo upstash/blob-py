@@ -65,7 +65,7 @@ _DEFAULT_MESSAGE: Dict[str, str] = {
 }
 
 _DEFAULT_HINT: Dict[str, str] = {
-    "signature_mismatch": "a 403 from R2 usually means the body length or type differs from the signature",
+    "signature_mismatch": "the upload did not match what was authorized, usually a different size or content type",
     "length_required": "pass size= or max_size= so the length is known before the first byte",
 }
 

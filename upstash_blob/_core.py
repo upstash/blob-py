@@ -227,7 +227,9 @@ def presign_payload(
     expires_in: float,
     headers: Optional[Mapping[str, str]] = None,
     query: Optional[Mapping[str, str]] = None,
+    part: Optional[Tuple[int, str]] = None,
 ) -> Dict[str, Any]:
+    """``part`` is ``(part_number, upload_id)``: the url then PUTs one part of a multipart upload."""
     presignable_key(path)
     body: Dict[str, Any] = {
         "method": method,
@@ -238,6 +240,8 @@ def presign_payload(
         body["headers"] = dict(headers)
     if query:
         body["query"] = dict(query)
+    if part is not None:
+        body["partNumber"], body["uploadId"] = part
     return body
 
 
@@ -349,10 +353,10 @@ def iso_date(value: Optional[str]) -> Optional[datetime]:
 
 def head_from_headers(h: httpx.Headers) -> Head:
     metadata = {k[11:]: v for k, v in h.items() if k.lower().startswith("x-amz-meta-")}
-    try:
-        size = int(h.get("content-length", "0"))
-    except ValueError:
-        size = 0
+    length = h.get("content-length", "")
+    if not length.isascii() or not length.isdigit():
+        raise BlobError("request_failed", "storage returned a missing or invalid Content-Length")
+    size = int(length)
     return Head(
         size=size,
         etag=h.get("etag", ""),
@@ -381,13 +385,20 @@ def error_from_body(status: int, xml: str) -> BlobError:
     if status == 403:
         return BlobError("signature_mismatch")
     if status == 429 or code in ("SlowDown", "TooManyRequests"):
-        return BlobError("rate_limited", "R2 rate limited the request")
+        return BlobError("rate_limited", "storage rate limited the request")
     if status == 503:
         return BlobError("not_ready")
     if status == 413 or code == "EntityTooLarge":
         return BlobError("too_large")
-    detail = (f" {code}" if code else "") + (f": {message}" if message else "")
-    return BlobError("request_failed", f"R2 responded {status}{detail}", status=502 if status >= 500 else status)
+    # Storage's own message is for whoever debugs the app, not for a user it would be shown to.
+    error = BlobError(
+        "request_failed",
+        f"storage responded {status}{f' {code}' if code else ''}",
+        status=502 if status >= 500 else status,
+    )
+    if message:
+        error.__cause__ = Exception(message)
+    return error
 
 
 def is_conditional(headers: Optional[Mapping[str, str]]) -> bool:
@@ -453,6 +464,13 @@ def parse_uploads(xml: str) -> Tuple[List[MultipartUpload], Optional[str], Optio
     )
 
 
+def parse_parts(xml: str) -> Tuple[List[Tuple[int, str]], Optional[str]]:
+    """The parts on this ListParts page, and the marker for the next one (None when this is the last)."""
+    parts = [(int(tag(b, "PartNumber") or 0), decode_entities(tag(b, "ETag") or "")) for b in blocks(xml, "Part")]
+    marker = tag(xml, "NextPartNumberMarker")
+    return parts, marker if tag(xml, "IsTruncated") == "true" and marker else None
+
+
 def complete_body(parts: Sequence[Tuple[int, str]]) -> str:
     inner = "".join(
         f"<Part><PartNumber>{n}</PartNumber><ETag>{escape_xml(etag)}</ETag></Part>" for n, etag in sorted(parts)
@@ -510,6 +528,8 @@ class BucketCore:
         decoded = decode_token(token)
         self._token = token
         self._bucket_id = decoded.bucket_id
+        # The bucket password, which never leaves the server: the key upload completion tokens are signed with.
+        self._signing_secret = decoded.password
         self._hostname = f"{decoded.hash_for_domain}.{DOMAIN_SUFFIX}"
         self._default_cache = cache
         self._telemetry = enable_telemetry
