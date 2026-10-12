@@ -47,7 +47,7 @@ from upstash_blob._keys import decode_entities, encode_key, meta_headers, nameab
 from upstash_blob._multipart import MultipartOption, part_count, part_size_for, wants_multipart
 from upstash_blob._sniff import check_content_type, expand_content_types
 from upstash_blob._token import AGENT_URL
-from upstash_blob._units import CacheOption, Duration, Size, cache_control, format_bytes, parse_duration, parse_size
+from upstash_blob._units import CacheOption, Duration, Size, cache_control, over_limit, parse_duration, parse_size
 from upstash_blob.errors import BlobError
 from upstash_blob.types import (
     AsyncBlobStream,
@@ -172,6 +172,10 @@ class AsyncBucket:
             attempt += 1
             creds = await self._credentials()
             url, signed = self._core._signed(creds, method, path, query, headers)
+            if method in ("GET", "HEAD"):
+                # httpx otherwise negotiates compression, which can drop Content-Length and weaken
+                # ETags; object reads need the stored representation for size checks and conditional writes.
+                signed = {**signed, "accept-encoding": "identity"}
             request = self._client.build_request(method, url, headers=signed, content=content)
             try:
                 res = await self._client.send(request, stream=stream)
@@ -328,7 +332,8 @@ class AsyncBucket:
         :param content_type: Defaults to a guess from the file name, else ``application/octet-stream``.
         :param content_types: Allowed types (``image/*``, ``application/pdf``); the leading bytes
             are checked against the declared type too.
-        :param max_size: Refuse a body over this size (``'20mb'``).
+        :param max_size: Refuse a body over this size (``'20MB'``). Decimal: ``'32MB'`` is 32,000,000
+            bytes; for 32 MiB pass ``'32MiB'`` or ``32 * 1024 * 1024``.
         :param size: Declared length for an iterable whose size is not otherwise known. Without it
             the body is buffered, up to ``max_size``, to learn its length.
         :param allow_overwrite: ``False`` refuses to replace an existing object: ``already_exists``.
@@ -351,9 +356,7 @@ class AsyncBucket:
             if length is None and size is not None:
                 length = parse_size(size, "size")
             if limit is not None and length is not None and length > limit:
-                raise BlobError(
-                    "too_large", f"the body is {format_bytes(length)}, over the {format_bytes(limit)} limit"
-                )
+                raise BlobError("too_large", f"the body is {over_limit(length, limit)}")
             if length is None:
                 if limit is None:
                     raise BlobError("length_required")

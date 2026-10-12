@@ -72,7 +72,7 @@ def test_fastapi(fake: Fake) -> None:
     client = TestClient(app)
     auth = {"authorization": "Bearer ok"}
 
-    assert client.get("/api/upload?route=doc").json() == {"constraints": {}}
+    assert client.get("/api/upload?route=doc").json() == {"protocol": 1, "constraints": {}}
     res = client.post("/api/upload?route=doc", json=BEGIN)
     assert (res.status_code, res.json()["code"]) == (401, "unauthorized")
     res = client.post("/api/upload?route=doc", json=BEGIN, headers=auth)

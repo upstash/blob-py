@@ -14,7 +14,7 @@ from upstash_blob._multipart import MULTIPART_THRESHOLD, SINGLE_PUT_MAX, part_co
 from upstash_blob._sigv4 import sign_headers
 from upstash_blob._sniff import check_content_type, expand_content_types, sniff
 from upstash_blob._token import decode_token, encode_token
-from upstash_blob._units import cache_control, parse_duration, parse_size
+from upstash_blob._units import cache_control, over_limit, parse_duration, parse_size
 
 PNG = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1])
 
@@ -212,7 +212,8 @@ class TestErrors:
         assert error_from_body(403, "<Error><Code>ExpiredToken</Code></Error>").code == "unauthorized"
         assert error_from_body(403, "<Error><Code>SignatureDoesNotMatch</Code></Error>").code == "signature_mismatch"
         e = error_from_body(500, "<Error><Code>InternalError</Code><Message>boom</Message></Error>")
-        assert (e.code, e.status, e.message) == ("request_failed", 502, "R2 responded 500 InternalError: boom")
+        assert (e.code, e.status, e.message) == ("request_failed", 502, "Storage responded 500 InternalError")
+        assert str(e.__cause__) == "boom" and "boom" not in str(e.to_dict())
 
 
 class TestHeaders:
@@ -229,15 +230,64 @@ class TestHeaders:
                 safe_content_type(bad)
 
 
-class TestUniquePath:
-    def test_values_cannot_add_directories(self) -> None:
-        path = unique_path("avatars/{}/{}", 7, "../../etc/My Photo.PNG")
-        assert re.fullmatch(r"avatars/7/my-photo-[1-9A-HJ-NP-Za-km-z]{8}\.png", path), path
+_SUFFIX = "[1-9A-HJ-NP-Za-km-z]{8}"
 
-    def test_named_fields_and_fallbacks(self) -> None:
-        assert re.fullmatch(r"u/file-\w{8}", unique_path("u/{name}", name="///"))
-        assert re.fullmatch(r"docs/r-sum-\w{8}\.pdf", unique_path("docs/{}", "r​ésum.pdf".replace("é", "-")))
-        assert unique_path("x/{}", "a") != unique_path("x/{}", "a")
+
+def _strip_suffix(path: str) -> str:
+    return re.sub(rf"-{_SUFFIX}(?=\.[a-z0-9]{{1,8}}$|$)", "", path, flags=re.IGNORECASE)
+
+
+class TestSizes:
+    def test_binary_units(self) -> None:
+        assert parse_size("32MiB") == 32 * 1024 * 1024
+        assert parse_size("1kib") == 1024 and parse_size("2GiB") == 2 * 1024**3 and parse_size("1TiB") == 1024**4
+        assert parse_size("32MB") == 32_000_000
+        with pytest.raises(ValueError, match="kib, mib"):
+            parse_size("3 bits")
+
+    def test_over_limit_shows_bytes_when_both_sides_round_alike(self) -> None:
+        assert over_limit(3_000_000, 2_000_000) == "3 MB, over the 2 MB limit"
+        assert over_limit(33_554_433, 33_554_432) == "33,554,433 bytes, over the 33,554,432 byte limit"
+        assert over_limit(2_000_001, 2_000_000) == "2,000,001 bytes, over the 2,000,000 byte limit"
+
+
+class TestUniquePath:
+    def test_keeps_the_path_as_given(self) -> None:
+        path = unique_path("users/Alice_123/Q3 Report (final).pdf")
+        assert re.fullmatch(rf"users/Alice_123/Q3 Report \(final\)-{_SUFFIX}\.pdf", path), path
+        for name in [
+            "café.pdf",
+            "日本語.pdf",
+            "a🙂b&c.pdf",
+            "a\u200bb.png",
+            "!!! ***",
+            "  a.png  ",
+            "A_" * 80 + ".png",
+        ]:
+            assert _strip_suffix(unique_path(f"u/{name}")) == f"u/{name}"
+        for owner in ["caf\u00e9", "cafe\u0301"]:
+            assert _strip_suffix(unique_path(f"users/{owner}/x.pdf")) == f"users/{owner}/x.pdf"
+
+    def test_the_suffix_goes_before_the_final_extension(self) -> None:
+        assert re.fullmatch(rf"REPORT-{_SUFFIX}\.PDF", unique_path("REPORT.PDF"))
+        assert re.fullmatch(rf"x\.exe-{_SUFFIX}\.png", unique_path("x.exe.png"))
+        assert re.fullmatch(rf"x\.superlongext-{_SUFFIX}", unique_path("x.superlongext"))
+        assert re.fullmatch(rf"\.env-{_SUFFIX}", unique_path(".env"))
+        assert re.fullmatch(rf"\.env-{_SUFFIX}\.local", unique_path(".env.local"))
+        assert re.fullmatch(rf"a\.png/thumbs/file-{_SUFFIX}", unique_path("a.png/thumbs/"))
+        assert re.fullmatch(rf"file-{_SUFFIX}", unique_path(""))
+
+    def test_traversal_is_refused_where_the_key_is_used(self) -> None:
+        for path in (unique_path("uploads/../x.png"), unique_path("a/./b.png"), unique_path("../x.png")):
+            with pytest.raises(ValueError):
+                encode_key(path)
+        assert re.fullmatch(rf"a/\.\.-{_SUFFIX}", unique_path("a/.."))
+
+    def test_suffixes_are_random_base58(self) -> None:
+        suffixes = [unique_path("a")[2:] for _ in range(500)]
+        assert len(set(suffixes)) == 500
+        seen = set("".join(suffixes))
+        assert len(seen) == 58 and not seen & set("0OIl")
 
 
 class TestReviewRegressions:

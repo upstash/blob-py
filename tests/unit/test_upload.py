@@ -339,6 +339,39 @@ async def test_begin_enforces_constraints(client: Client, fake: Fake) -> None:
     assert not fake.presigns
 
 
+async def test_every_successful_answer_carries_the_protocol(client: Client) -> None:
+    h = client.handler(on_before_upload=before("big/p"), multipart=True)
+    answers = []
+    _, begun = await client.begin(h, name="p", size=6 * MIB, type="", protocol=1)
+    answers.append(begun)
+    token = begun["completionToken"]
+    answers.append((await client.post(h, {"phase": "parts", "completionToken": token, "protocol": 7}))[1])
+    client.put_parts("big/p", b"x" * 6 * MIB, 5 * MIB)
+    answers.append((await client.post(h, {"phase": "end", "completionToken": token}))[1])
+    _, second = await client.begin(h, name="p", size=6 * MIB, type="")
+    answers.append((await client.post(h, {"phase": "cancel", "completionToken": second["completionToken"]}))[1])
+    assert [a["protocol"] for a in answers] == [1, 1, 1, 1]
+    status, refused = await client.post(h, {"phase": "end", "completionToken": "x.y"})
+    assert status == 403 and "protocol" not in refused
+
+
+async def test_a_traversing_path_is_the_clients_bad_input(client: Client, fake: Fake) -> None:
+    h = client.handler(on_before_upload=lambda a: BeforeUploadResult(path=f"u1/{a.file.name}"))
+    for name in ("../x.png", "./x.png", ".."):
+        status, body = await client.begin(h, name=name)
+        assert (status, body["code"]) == (400, "invalid_input"), body
+    assert not fake.presigns
+
+
+async def test_binary_limits_read_as_exact_bytes(client: Client) -> None:
+    h = client.handler(max_size="32MiB", on_before_upload=before())
+    status, body = await client.begin(h, size=32 * MIB + 1)
+    assert (status, body["code"]) == (413, "too_large")
+    assert body["message"] == "a.png is 33,554,433 bytes, over the 33,554,432 byte limit"
+    status, _ = await client.begin(h, size=32 * MIB)
+    assert status == 200
+
+
 async def test_before_upload_may_narrow_but_not_widen(client: Client) -> None:
     h = client.handler(max_size="1kb", on_before_upload=before(max_size=10))
     status, body = await client.begin(h)
@@ -355,7 +388,7 @@ async def test_get_serves_limits_with_an_etag(client: Client) -> None:
     h = client.handler(content_types=["image/png"], max_size="2mb", on_before_upload=before())
     res = await client.call(h, "GET")
     assert res.status == 200
-    assert json.loads(res.body) == {"constraints": {"contentTypes": ["image/png"], "maxSize": 2_000_000}}
+    assert json.loads(res.body) == {"protocol": 1, "constraints": {"contentTypes": ["image/png"], "maxSize": 2_000_000}}
     assert res.headers["cache-control"] == "public, max-age=60"
     again = await client.call(h, "GET", headers={"if-none-match": res.headers["etag"]})
     assert again.status == 304 and again.body == b""

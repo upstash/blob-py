@@ -24,10 +24,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from upstash_blob._core import safe_content_type
+from upstash_blob._keys import presignable_key
 from upstash_blob._multipart import MultipartOption
 from upstash_blob._sniff import SNIFF_BYTES, check_content_type, expand_content_types
 from upstash_blob._token import to_base64url
-from upstash_blob._units import CacheOption, Size, format_bytes, parse_size
+from upstash_blob._units import CacheOption, Size, over_limit, parse_size
 from upstash_blob.errors import BlobError
 from upstash_blob.types import CompletedBlob
 
@@ -41,6 +42,20 @@ the ones THIS upload put there? A presigned PUT is written by the browser, so th
 may be anybody's: a stale token's, a concurrent upload's, or one that was there all along.
 """
 UPLOAD_MARKER_HEADER = f"x-amz-meta-{UPLOAD_MARKER}"
+
+UPLOAD_PROTOCOL = 1
+"""
+The version of the upload route protocol, which this handler speaks with ``@upstash/blob``'s browser
+client and React hooks. It is not the package version, and it is the same number blob-js's
+``uploadHandler`` speaks: the contract lives in blob-js ``src/shared/protocol.ts``.
+
+Every upload route JSON body carries it as a top-level ``protocol`` key. The client sends it on every
+POST; the server on the GET constraints document and on every 2xx answer to a POST. Error answers
+carry none. Missing, or anything but an integer of at least 1, is 1. Every change is additive and
+nothing is refused over the number, so at 1 the server does not read the client's.
+
+1: phases begin, parts, end and cancel; the GET constraints document.
+"""
 
 PARTS_PER_BATCH = 16
 TOKEN_TTL_MS = 7 * 86_400_000
@@ -193,9 +208,7 @@ def resolve_constraints(content_types: Optional[Sequence[str]], max_size: Option
 
 def enforce(c: Constraints, file: FileInfo, head: Optional[bytes]) -> None:
     if c.max_size is not None and file.size > c.max_size:
-        raise BlobError(
-            "too_large", f"{file.name} is {format_bytes(file.size)}, over the {format_bytes(c.max_size)} limit"
-        )
+        raise BlobError("too_large", f"{file.name} is {over_limit(file.size, c.max_size)}")
     if c.content_types is not None:
         check_content_type(file.type, head, c.content_types)
 
@@ -224,7 +237,7 @@ def constraints_response(c: Constraints) -> Tuple[bytes, str]:
         served["contentTypes"] = c.content_types
     if c.max_size is not None:
         served["maxSize"] = c.max_size
-    body = json.dumps({"constraints": served}, separators=(",", ":")).encode()
+    body = json.dumps({"protocol": UPLOAD_PROTOCOL, "constraints": served}, separators=(",", ":")).encode()
     return body, f'"{hashlib.sha256(body).hexdigest()[:16]}"'
 
 
@@ -413,9 +426,7 @@ def read_from(raw: Any) -> int:
     return n if n is not None and n >= 1 else 1
 
 
-def read_landed(raw: Any) -> List[Tuple[int, str]]:
-    if not isinstance(raw, list):
-        return []
+def check_landed(raw: List[Any]) -> List[Tuple[int, str]]:
     out: List[Tuple[int, str]] = []
     for p in raw:
         n = _int(p.get("n")) if isinstance(p, dict) else None
@@ -459,6 +470,11 @@ def input_of(body: Mapping[str, Any]) -> Any:
 def check_decided(decided: Any) -> BeforeUploadResult:
     if not isinstance(decided, BeforeUploadResult) or not isinstance(decided.path, str):
         raise TypeError(f"on_before_upload must return BeforeUploadResult(path=...), got {type(decided).__name__}")
+    try:
+        presignable_key(decided.path)
+    except ValueError as e:
+        # unique_path keeps the browser's filename as given, so a "../" in the path can be the client's.
+        raise BlobError("invalid_input", str(e)) from e
     return decided
 
 
@@ -579,6 +595,14 @@ def token_expiry() -> int:
 
 
 # --------------------------------------------------------------- responses
+
+
+def answer(value: Dict[str, Any]) -> UploadResponse:
+    """
+    Every successful answer carries the protocol of the server that wrote it. On a deploy, instances
+    of two releases answer one upload side by side, so the client reads each answer by its own number.
+    """
+    return json_response({**value, "protocol": UPLOAD_PROTOCOL})
 
 
 def json_response(value: Any, status: int = 200) -> UploadResponse:

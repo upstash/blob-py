@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from upstash_blob._core import MAX_PRESIGN_SECONDS, TOKEN_ENV
-from upstash_blob._keys import meta_headers, presignable_key
+from upstash_blob._keys import meta_headers
 from upstash_blob._multipart import MultipartOption, part_size_for, wants_multipart
 from upstash_blob._sync import Bucket
 from upstash_blob._units import Size, cache_control
@@ -19,8 +19,10 @@ from upstash_blob._upload import (
     Mounted,
     UploadRoute,
     Validator,
+    answer,
     check_decided,
     check_grant,
+    check_landed,
     check_metadata,
     check_request,
     complete_args,
@@ -31,7 +33,6 @@ from upstash_blob._upload import (
     error_response,
     header,
     input_of,
-    json_response,
     limits_response,
     logger,
     mapped_answer,
@@ -45,7 +46,6 @@ from upstash_blob._upload import (
     read_file,
     read_from,
     read_head,
-    read_landed,
     sign_grant,
     token_expiry,
     validate_input,
@@ -101,7 +101,8 @@ class UploadHandler:
             from ``UPSTASH_BLOB_TOKEN``, once.
         :param content_types: What the routes accept: ``["image/*", "application/pdf"]``. Checked
             against the declared type and the file's first bytes.
-        :param max_size: The largest file the routes accept: ``"20mb"``.
+        :param max_size: The largest file the routes accept: ``"20MB"``. Decimal: ``"32MB"`` is
+            32,000,000 bytes; for 32 MiB pass ``"32MiB"`` or ``32 * 1024 * 1024``.
         :param multipart: Where a file stops going up as one PUT and starts going up in parts (16 MB
             by default). Parts buy pause, resume and per-part retry.
         :param input: Validates what the browser sends as ``input``: a pydantic model, a
@@ -110,9 +111,13 @@ class UploadHandler:
             callback. Raise to refuse: ``BlobError("unauthorized")``, or any exception with a
             ``status_code`` of 401.
         :param on_before_upload: Decides the path. Returns ``BeforeUploadResult``.
-        :param on_upload_complete: Runs once the object is stored. What it returns reaches the
-            browser as ``upload.blob.data``. Raising deletes the object. Delivery is at-least-once:
-            use ``upload_id`` as an idempotency key.
+        :param on_upload_complete: Runs once the object is stored, and only after the route verified
+            its signed completion token and that the stored object has the declared size: a forged
+            or expired token, or one from another route or ``endpoint``, is a 403. What it returns
+            reaches the browser as ``upload.blob.data``. Raising refuses: the object is deleted,
+            unless it cannot be identified as this upload's (a retried multipart 'end', or a newer
+            upload replaced it), in which case it is kept and logged. It may run more than once, or
+            never if the browser stops before 'end': use ``upload_id`` as an idempotency key.
         :param on_error: Sees every refusal. Return a ``BlobError`` to answer with it, a framework
             response to answer with that, or None to leave the answer alone.
         :param routes: Named routes, each an ``UploadRoute``.
@@ -189,13 +194,13 @@ class UploadHandler:
             data = read_body(body)
             phase = data["phase"]
             if phase == "begin":
-                return json_response(self._begin(m, ctx, request, data, details))
+                return answer(self._begin(m, ctx, request, data, details))
             if phase == "parts":
-                return json_response(self._parts(m, data, details))
+                return answer(self._parts(m, data, details))
             if phase == "end":
-                return json_response(self._end(m, ctx, request, data, details))
+                return answer(self._end(m, ctx, request, data, details))
             if phase == "cancel":
-                return json_response(self._cancel(m, data, details))
+                return answer(self._cancel(m, data, details))
             raise BlobError("invalid_input", f"unknown phase {phase}")
         except Exception as e:
             return self._answer(e, m, ctx, request, details, native)
@@ -204,16 +209,16 @@ class UploadHandler:
         # Never the names it does mount, and never a 500: an unknown route is a 404 like any other.
         error = BlobError("not_found", "unknown upload route")
         if self._on_error is not None:
-            answer = mapped_answer(_settle(self._on_error(error_args(None, name, request, error, Details()))), native)
-            if answer is not None:
-                return answer
+            mapped = mapped_answer(_settle(self._on_error(error_args(None, name, request, error, Details()))), native)
+            if mapped is not None:
+                return mapped
         return error_response(error)
 
     def _answer(self, e: Exception, m: Mounted, ctx: Any, request: Any, d: Details, native: Optional[type]) -> Any:
         if m.on_error is not None:
-            answer = mapped_answer(_settle(m.on_error(error_args(ctx, m.name, request, e, d))), native)
-            if answer is not None:
-                return answer
+            mapped = mapped_answer(_settle(m.on_error(error_args(ctx, m.name, request, e, d))), native)
+            if mapped is not None:
+                return mapped
         return default_answer(e)
 
     # ------------------------------------------------------------- phases
@@ -231,7 +236,6 @@ class UploadHandler:
         value = validate_input(m.input, input_of(body))
 
         decided = check_decided(_settle(m.on_before_upload(BeforeUploadArgs(ctx, m.name, request, file, value))))
-        presignable_key(decided.path)
         d.path, d.state = decided.path, decided.state
         narrow(m.constraints, decided, file, head)
 
@@ -308,9 +312,12 @@ class UploadHandler:
         d.file = g.file
 
         expected = part_count(g)
-        landed = read_landed(body.get("parts"))
-        if len(landed) != expected and g.upload_id:
+        raw = body.get("parts")
+        sent: List[Any] = raw if isinstance(raw, list) else []
+        if len(sent) != expected and g.upload_id:
             landed = bucket._list_parts(g.path, g.upload_id)
+        else:
+            landed = check_landed(sent)
         if len(landed) != expected:
             raise BlobError("invalid_input", f"expected {expected} parts, {len(landed)} landed")
         # What discard() checks before deleting: that the object still holds this upload's bytes.
