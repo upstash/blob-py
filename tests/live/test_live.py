@@ -29,7 +29,7 @@ def code_of(fn: Any, *args: Any, **kwargs: Any) -> str:
 
 class TestPut:
     def test_bytes_then_get_info_exists(self, pub: Bucket) -> None:
-        blob = pub.put(p("a.txt"), "hello", content_type="text/plain", metadata={"uploadedBy": "u1"})
+        blob = pub.put(p("a.txt"), "hello", content_type="text/plain", metadata={"uploadedby": "u1"})
         assert blob.size == 5
         assert re.fullmatch(r'"[0-9a-f]{32}"', blob.etag)
         assert re.match(r"https://b[0-9a-f]{11}\.blob\.upstash\.io/test/", blob.url or "")

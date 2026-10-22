@@ -1,5 +1,6 @@
 from upstash_blob._async import AsyncBucket
 from upstash_blob._body import PutBody
+from upstash_blob._core import RetryConfig
 from upstash_blob._multipart import MultipartOption
 from upstash_blob._sync import Bucket
 from upstash_blob._unique_path import unique_path
@@ -52,6 +53,7 @@ __all__ = [
     "MultipartOption",
     "MultipartUpload",
     "PutBody",
+    "RetryConfig",
     "S3Config",
     "SignedReadUrl",
     "SignedUploadUrl",

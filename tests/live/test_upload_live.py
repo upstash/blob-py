@@ -136,3 +136,16 @@ async def test_async_handler_single_put() -> None:
         res = await h.handle("POST", body=json.dumps(end).encode(), headers=JSON)
         assert res.status == 200, res.body
         assert (await bucket.get(p("h/async.txt"))).content == body
+
+
+def test_storage_answers_the_preflight_the_probe_sends(pub: Bucket) -> None:
+    from upstash_blob._upload import CorsProbe
+
+    h = UploadHandler(bucket=pub, on_before_upload=lambda a: BeforeUploadResult(path=p("cors/a.txt")))
+    begun = post(h, {"phase": "begin", "file": {"name": "a.txt", "type": "text/plain", "size": 5}})
+    part = begun["upload"]["parts"][0]
+    origin = "https://not-on-the-list.invalid"
+    res = httpx.request(**CorsProbe.request(origin, part["url"], part["headers"]))
+    # The test buckets allow every origin, so this is the allowed answer; a refusal is unit tested.
+    assert res.headers.get("access-control-allow-origin") == "*"
+    assert CorsProbe.verdict(origin, res) is True

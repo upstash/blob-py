@@ -47,7 +47,8 @@ async with AsyncBucket.from_env() as bucket:
   needs `size=` or `max_size=`.
 - `content_types=["image/*"]` checks the declared type and the file's first bytes; `max_size="20mb"`
   refuses anything larger, while streaming too.
-- A body over 16 MB goes up as multipart; `multipart="100mb" | True | False` moves the line.
+- A body over 16 MB goes up as multipart, up to four parts at a time within a 64 MiB buffer;
+  `multipart="100mb" | True | False` moves the line. A failed part aborts the upload.
   `allow_overwrite=False` and `if_unchanged=etag` are single-PUT only.
 - `get` and `info` raise `not_found` rather than returning None; `list` returns keys, sizes, etags
   and urls, without metadata. `cursor` is set only while more remains.
@@ -55,7 +56,11 @@ async with AsyncBucket.from_env() as bucket:
 - `copy` and `move` take `content_type`, `cache`, `metadata`; whatever is not given is carried over
   from the source. `move` is a copy plus a delete: a failed delete raises `move_left_a_copy`.
 - `delete(prefix="")` needs `all=True`. A partial list delete raises `partial_delete`.
-- Metadata is printable ASCII; anything else is refused with `invalid_input`.
+- Metadata keys are lowercase (storage reads them back lowercased) and values printable ASCII;
+  anything else is refused with `invalid_input`.
+- `retry={"retries": 5, "backoff": lambda n: 100 * 2**n}` (milliseconds before retry `n`, from 0)
+  tunes how failed requests are retried, and `retry=False` sends each once. The default is 2 retries
+  with jittered backoff from 200 ms; a Retry-After from the service always wins.
 - `cache` takes `"immutable"`, `"revalidate"`, `"no-store"`, a duration (`"15m"`, `3600`,
   `timedelta`), or a verbatim header.
 - Sizes count bytes. Decimal units (`KB`, `MB`, `GB`, `TB`) are powers of 1,000 and binary units
@@ -86,6 +91,7 @@ from upstash_blob.fastapi import upload_view
 
 uploads = AsyncUploadHandler(
     context=require_user,  # its return is `ctx`; raise a 401 to refuse
+    owner=lambda user: user.id,  # binds each upload to who began it
     on_before_upload=lambda a: BeforeUploadResult(path=unique_path(f"u/{a.ctx.id}/{a.file.name}")),
     on_upload_complete=lambda a: {"url": a.url},  # reaches the browser as upload.blob.data
     routes={
@@ -106,6 +112,12 @@ const upload = useUpload('avatar');  // POSTs to /api/upload?route=avatar
   route=..., body=..., headers=..., native=<framework response class>)` returns an `UploadResponse`.
 - Omit `bucket=` to use `UPSTASH_BLOB_TOKEN`. Every handler option is a default a route may replace;
   `content_types=None` or `max_size=None` on a route clears the handler's.
+- `context` runs on every POST of an upload: check the session there. `owner` signs who began an
+  upload into it; a later request from anyone else is a 403, so one signed-in user cannot finish,
+  re-sign or cancel another's upload. An `owner` of None or `""` is a 401.
+- The first upload from each page origin also sends storage the CORS preflight the browser will, and
+  logs a warning on the `upstash_blob` logger when storage refuses it: add the origin to the bucket's
+  CORS settings in the Upstash Console.
 - `input=` validates what the browser sends as `input`: a pydantic model, a `TypeAdapter`, or a
   callable that raises `ValueError`.
 - `on_upload_complete` runs at least once per upload; `upload_id` is stable across deliveries.

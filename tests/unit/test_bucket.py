@@ -122,7 +122,7 @@ class TestRetries:
 
 class TestPut:
     def test_bytes_then_read_back(self, fake: Fake, bucket: Bucket) -> None:
-        blob = bucket.put("dir/a b.txt", "hello", content_type="text/plain", metadata={"Owner": "u1"})
+        blob = bucket.put("dir/a b.txt", "hello", content_type="text/plain", metadata={"owner": "u1"})
         assert (blob.size, blob.content_type) == (5, "text/plain")
         assert blob.url == "https://b0123456789a.blob.upstash.io/dir/a%20b.txt"
         assert blob.versioned_url == f"{blob.url}?v=%22{blob.etag.strip(chr(34))}%22"
@@ -674,3 +674,195 @@ class TestAiohttpBodyPart:
 
         await abucket.put("part", BodyPart(), size=11)
         assert fake.objects["part"].data == b"hello world"
+
+
+class TestRetryOption:
+    def test_false_sends_once(self, fake: Fake) -> None:
+        fake.intercept = lambda r: error(503, "Busy")
+        assert code_of(make(fake, retry=False).exists, "a") == "not_ready"
+        assert len(fake.r2_calls()) == 1
+
+    def test_retries_and_backoff(self, fake: Fake, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list = []
+        monkeypatch.setattr("upstash_blob._sync.time.sleep", slept.append)
+        counts: list = []
+        fake.intercept = lambda r: error(500, "InternalError")
+        b = make(fake, retry={"retries": 4, "backoff": lambda n: counts.append(n) or 250})
+        assert code_of(b.exists, "a") == "request_failed"
+        assert len(fake.r2_calls()) == 5
+        assert counts == [0, 1, 2, 3] and slept == [0.25] * 4
+
+    def test_a_retry_after_wins_over_a_custom_backoff(self, fake: Fake, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list = []
+        monkeypatch.setattr("upstash_blob._sync.time.sleep", slept.append)
+        answers = [httpx.Response(429, headers={"retry-after": "1.5"})]
+        fake.intercept = lambda r: answers.pop(0) if answers else None
+        assert make(fake, retry={"backoff": lambda n: 9000}).exists("a") is False
+        assert slept == [1.5]
+
+    def test_a_bad_backoff_value_is_no_wait(self, fake: Fake, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list = []
+        monkeypatch.setattr("upstash_blob._sync.time.sleep", slept.append)
+        fake.intercept = lambda r: error(500, "InternalError")
+        waits = [float("nan"), -5, float("inf"), 1e18]
+        b = make(fake, retry={"retries": 4, "backoff": lambda n: waits[n]})
+        code_of(b.exists, "a")
+        assert slept[:3] == [0, 0, 0] and 0 < slept[3] < 10**7
+
+    def test_signing_and_credentials_follow_it(self, fake: Fake, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list = []
+        monkeypatch.setattr("upstash_blob._sync.time.sleep", slept.append)
+        fake.mint_response = lambda: httpx.Response(503)
+        assert code_of(make(fake, retry={"retries": 1, "backoff": lambda n: 50}).exists, "a") == "not_ready"
+        assert fake.mints == 2 and slept == [0.05]
+        reset_credential_caches()
+        fake.mint_response = None
+        fake.presign_response = lambda body: httpx.Response(502)
+        presigns = len(fake.presigns)
+        assert code_of(make(fake, retry=False).signed_read_url, "a") == "request_failed"
+        assert len(fake.presigns) - presigns == 1
+
+    def test_the_default_mint_wait_without_a_retry_after(self, fake: Fake, monkeypatch: pytest.MonkeyPatch) -> None:
+        slept: list = []
+        monkeypatch.setattr("upstash_blob._sync.time.sleep", slept.append)
+        fake.mint_response = lambda: httpx.Response(429)
+        assert code_of(make(fake).exists, "a") == "rate_limited"
+        assert fake.mints == 4 and slept == [2.0, 2.0, 2.0]
+
+    @pytest.mark.parametrize(
+        "bad", [{"retries": -1}, {"retries": True}, {"retries": "2"}, {"backoff": 3}, {"tries": 2}, True, 3]
+    )
+    def test_bad_options_fail_at_construction(self, fake: Fake, bad: Any) -> None:
+        with pytest.raises(TypeError):
+            make(fake, retry=bad)
+
+    async def test_async_follows_it(self, fake: Fake) -> None:
+        fake.intercept = lambda r: error(503, "Busy")
+        ab = AsyncBucket(
+            TOKEN,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(fake.ahandler)),
+            retry={"retries": 5},
+        )
+        with pytest.raises(BlobError):
+            await ab.exists("a")
+        assert len(fake.r2_calls()) == 6
+        fake.calls.clear()
+        ab = AsyncBucket(
+            TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(fake.ahandler)), retry=False
+        )
+        with pytest.raises(BlobError):
+            await ab.exists("a")
+        assert len(fake.r2_calls()) == 1
+
+
+MIB = 1024 * 1024
+
+
+def is_part(r: httpx.Request) -> bool:
+    return r.method == "PUT" and "partNumber=" in str(r.url)
+
+
+class TestParallelParts:
+    def test_concurrency_shrinks_with_the_part_size(self) -> None:
+        from upstash_blob._multipart import part_concurrency_for
+
+        sizes = [5, 12, 13, 15, 16, 22, 32, 40]
+        assert [part_concurrency_for(s * MIB) for s in sizes] == [4, 4, 3, 3, 3, 1, 1, 1]
+
+    def test_four_parts_are_in_flight_at_once(self, fake: Fake, bucket: Bucket) -> None:
+        import threading
+
+        gate = threading.Barrier(4, timeout=5)
+
+        def hold(r: httpx.Request) -> Optional[httpx.Response]:
+            # Passes only once four part PUTs are waiting together.
+            if is_part(r) and r.url.params["partNumber"] in ("1", "2", "3", "4"):
+                gate.wait()
+            return None
+
+        fake.intercept = hold
+        data = bytes(range(256)) * (21 * MIB // 256)
+        blob = bucket.put("par.bin", data, multipart=True)
+        assert fake.objects["par.bin"].data == data and blob.size == len(data)
+        assert not fake.uploads
+
+    def test_the_first_failure_aborts_and_stops_reading(self, fake: Fake, bucket: Bucket) -> None:
+        fake.intercept = lambda r: error(400, "BadDigest") if is_part(r) and r.url.params["partNumber"] == "2" else None
+        reads = []
+
+        def body() -> Iterator[bytes]:
+            for i in range(12):
+                reads.append(i)
+                yield b"x" * (5 * MIB)
+
+        with pytest.raises(BlobError) as e:
+            bucket.put("fail.bin", body(), size=60 * MIB, multipart=True)
+        assert e.value.status == 400
+        assert not fake.uploads and "fail.bin" not in fake.objects
+        assert len(reads) < 12
+
+    def test_parts_refused_together_remint_once(self, fake: Fake, bucket: Bucket) -> None:
+        import threading
+
+        gate = threading.Barrier(4, timeout=5)
+        refused: set = set()
+        lock = threading.Lock()
+
+        def expire(r: httpx.Request) -> Optional[httpx.Response]:
+            if not is_part(r):
+                return None
+            n = r.url.params["partNumber"]
+            with lock:
+                first = n not in refused
+                refused.add(n)
+            if first and n in ("1", "2", "3", "4"):
+                gate.wait()
+                return error(403, "ExpiredToken")
+            return None
+
+        fake.intercept = expire
+        bucket.put("exp.bin", b"y" * (20 * MIB), multipart=True)
+        assert fake.mints == 2
+
+    async def test_async_four_parts_are_in_flight_at_once(self, fake: Fake) -> None:
+        import asyncio
+
+        arrived = 0
+        gate = asyncio.Event()
+
+        async def handler(r: httpx.Request) -> httpx.Response:
+            nonlocal arrived
+            if is_part(r) and r.url.params["partNumber"] in ("1", "2", "3", "4"):
+                arrived += 1
+                if arrived == 4:
+                    gate.set()
+                await asyncio.wait_for(gate.wait(), 5)
+            return await fake.ahandler(r)
+
+        ab = AsyncBucket(TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        data = bytes(range(256)) * (21 * MIB // 256)
+        await ab.put("apar.bin", data, multipart=True)
+        assert fake.objects["apar.bin"].data == data and not fake.uploads
+
+    async def test_async_a_failed_part_does_not_wait_for_a_slow_body(self, fake: Fake, abucket: AsyncBucket) -> None:
+        import asyncio
+
+        fake.intercept = lambda r: error(400, "BadDigest") if is_part(r) else None
+
+        async def body() -> Any:
+            yield b"x" * (5 * MIB)
+            await asyncio.Event().wait()  # never sends the rest
+            yield b""
+
+        with pytest.raises(BlobError) as e:
+            await asyncio.wait_for(abucket.put("slow.bin", body(), size=20 * MIB, multipart=True), 5)
+        assert e.value.status == 400
+        assert not fake.uploads
+
+
+class TestMetadataKeys:
+    def test_an_uppercase_key_is_refused_with_the_fix(self, fake: Fake, bucket: Bucket) -> None:
+        with pytest.raises(BlobError) as e:
+            bucket.put("m", "x", metadata={"recordId": "7"})
+        assert e.value.code == "invalid_input" and '"recordid"' in (e.value.hint or "")
+        assert not fake.r2_calls()

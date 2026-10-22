@@ -1,5 +1,6 @@
 import inspect
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -14,6 +15,7 @@ from upstash_blob._upload import (
     UPLOAD_MARKER_HEADER,
     BeforeUploadArgs,
     Callback,
+    CorsProbe,
     Details,
     Grant,
     Mounted,
@@ -24,6 +26,7 @@ from upstash_blob._upload import (
     check_grant,
     check_landed,
     check_metadata,
+    check_owner_option,
     check_request,
     complete_args,
     default_answer,
@@ -39,6 +42,7 @@ from upstash_blob._upload import (
     mount_routes,
     narrow,
     not_allowed,
+    owner_string,
     part_count,
     pick_route,
     plan_parts,
@@ -90,6 +94,7 @@ class UploadHandler:
         multipart: Optional[MultipartOption] = None,
         input: Optional[Validator] = None,
         context: Optional[Callback] = None,
+        owner: Optional[Callback] = None,
         on_before_upload: Optional[Callback] = None,
         on_upload_complete: Optional[Callback] = None,
         on_error: Optional[Callback] = None,
@@ -109,7 +114,11 @@ class UploadHandler:
             ``TypeAdapter``, or a callable that raises ValueError.
         :param context: Runs once per POST, before the route. Its return is ``ctx`` in every
             callback. Raise to refuse: ``BlobError("unauthorized")``, or any exception with a
-            ``status_code`` of 401.
+            ``status_code`` of 401. The place for the session check.
+        :param owner: Who an upload belongs to, read from ``ctx``: ``owner=lambda user: user.id``.
+            Signed into the upload at 'begin'; a later request whose ``ctx`` names someone else is a
+            403 before storage or any callback is touched, so one signed-in user cannot finish,
+            re-sign or cancel another's upload. None or "" is a 401. Needs ``context``.
         :param on_before_upload: Decides the path. Returns ``BeforeUploadResult``.
         :param on_upload_complete: Runs once the object is stored, and only after the route verified
             its signed completion token and that the stored object has the declared size: a forged
@@ -124,8 +133,11 @@ class UploadHandler:
         :param endpoint: Where this handler is mounted. Only needed to separate two handlers on one
             bucket whose route names would otherwise collide.
         """
+        check_owner_option(owner, context)
         self._context = context
+        self._owner = owner
         self._on_error = on_error
+        self._cors = CorsProbe()
         self._env_bucket: Optional[Bucket] = None
         defaults = UploadRoute(
             bucket=bucket,
@@ -194,13 +206,13 @@ class UploadHandler:
             data = read_body(body)
             phase = data["phase"]
             if phase == "begin":
-                return answer(self._begin(m, ctx, request, data, details))
+                return answer(self._begin(m, ctx, request, data, details, header(headers, "origin")))
             if phase == "parts":
-                return answer(self._parts(m, data, details))
+                return answer(self._parts(m, ctx, data, details))
             if phase == "end":
                 return answer(self._end(m, ctx, request, data, details))
             if phase == "cancel":
-                return answer(self._cancel(m, data, details))
+                return answer(self._cancel(m, ctx, data, details))
             raise BlobError("invalid_input", f"unknown phase {phase}")
         except Exception as e:
             return self._answer(e, m, ctx, request, details, native)
@@ -223,7 +235,29 @@ class UploadHandler:
 
     # ------------------------------------------------------------- phases
 
-    def _begin(self, m: Mounted, ctx: Any, request: Any, body: Dict[str, Any], d: Details) -> Dict[str, Any]:
+    def _owner_of(self, ctx: Any) -> Optional[str]:
+        if self._owner is None:
+            return None
+        return owner_string(_settle(self._owner(ctx)))
+
+    def _probe(self, bucket: Bucket, origin: Optional[str], url: str, headers: Any) -> None:
+        claimed = self._cors.claim(origin)
+        if claimed is None:
+            return
+
+        def run() -> None:
+            try:
+                res = bucket._client.request(**CorsProbe.request(claimed, url, headers))
+                allowed = CorsProbe.verdict(claimed, res)
+            except Exception:
+                allowed = None
+            self._cors.settle(claimed, allowed)
+
+        threading.Thread(target=run, name="upstash-blob-cors-probe", daemon=True).start()
+
+    def _begin(
+        self, m: Mounted, ctx: Any, request: Any, body: Dict[str, Any], d: Details, origin: Optional[str]
+    ) -> Dict[str, Any]:
         file = read_file(body.get("file"))
         d.file = file
         if file.size == 0:
@@ -234,6 +268,8 @@ class UploadHandler:
         head = read_head(body.get("head"))
         enforce(m.constraints, file, head)
         value = validate_input(m.input, input_of(body))
+        # Before on_before_upload and storage: a request with no owner leaves no row and no multipart behind.
+        owner = self._owner_of(ctx)
 
         decided = check_decided(_settle(m.on_before_upload(BeforeUploadArgs(ctx, m.name, request, file, value))))
         d.path, d.state = decided.path, decided.state
@@ -274,6 +310,7 @@ class UploadHandler:
             # One part covering the whole file is how a single PUT is expressed: the browser runs the
             # same loop over one url, and only this side knows the url is an object PUT.
             part_size=part_size_for(file.size) if multipart else file.size,
+            owner=owner,
         )
         try:
             token = sign_grant(grant, core._signing_secret)
@@ -287,15 +324,24 @@ class UploadHandler:
                 except Exception:
                     logger.exception("upload %r could not be signed and its multipart was not aborted", decided.path)
             raise
+        if parts:
+            self._probe(bucket, origin, parts[0]["url"], parts[0].get("headers"))
         return {
             "completionToken": token,
             "path": decided.path,
             "upload": {"partSize": grant.part_size, "multipart": multipart, "parts": parts},
         }
 
-    def _parts(self, m: Mounted, body: Dict[str, Any], d: Details) -> Dict[str, Any]:
+    def _parts(self, m: Mounted, ctx: Any, body: Dict[str, Any], d: Details) -> Dict[str, Any]:
         bucket: Bucket = m.bucket
-        g = check_grant(body.get("completionToken"), bucket._core._signing_secret, bucket._core._bucket_id, m.id, d)
+        g = check_grant(
+            body.get("completionToken"),
+            bucket._core._signing_secret,
+            bucket._core._bucket_id,
+            m.id,
+            d,
+            self._owner_of(ctx),
+        )
         # Nothing lands early on a single PUT: it is one object write, so a resumed upload runs it again.
         landed = bucket._list_parts(g.path, g.upload_id) if g.upload_id else []
         return {
@@ -308,7 +354,14 @@ class UploadHandler:
 
     def _end(self, m: Mounted, ctx: Any, request: Any, body: Dict[str, Any], d: Details) -> Dict[str, Any]:
         bucket: Bucket = m.bucket
-        g = check_grant(body.get("completionToken"), bucket._core._signing_secret, bucket._core._bucket_id, m.id, d)
+        g = check_grant(
+            body.get("completionToken"),
+            bucket._core._signing_secret,
+            bucket._core._bucket_id,
+            m.id,
+            d,
+            self._owner_of(ctx),
+        )
         d.file = g.file
 
         expected = part_count(g)
@@ -364,9 +417,16 @@ class UploadHandler:
                 raise
         return end_json(blob, data)
 
-    def _cancel(self, m: Mounted, body: Dict[str, Any], d: Details) -> Dict[str, Any]:
+    def _cancel(self, m: Mounted, ctx: Any, body: Dict[str, Any], d: Details) -> Dict[str, Any]:
         bucket: Bucket = m.bucket
-        g = check_grant(body.get("completionToken"), bucket._core._signing_secret, bucket._core._bucket_id, m.id, d)
+        g = check_grant(
+            body.get("completionToken"),
+            bucket._core._signing_secret,
+            bucket._core._bucket_id,
+            m.id,
+            d,
+            self._owner_of(ctx),
+        )
         if g.upload_id:
             bucket._abort_multipart(g.path, g.upload_id)
             return {"ok": True}

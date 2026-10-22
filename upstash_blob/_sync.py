@@ -1,9 +1,11 @@
 import contextlib
 import json
 import os
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 import httpx
 
@@ -15,11 +17,11 @@ from upstash_blob._core import (
     DEFAULT_TIMEOUT,
     MAX_PRESIGN_SECONDS,
     RETRIABLE_METHODS,
-    RETRY_ATTEMPTS,
     TOKEN_ENV,
     BucketCore,
     Credentials,
     Head,
+    RetryOption,
     attachment_disposition,
     backoff,
     check_etag,
@@ -42,7 +44,7 @@ from upstash_blob._core import (
     transport_error,
 )
 from upstash_blob._keys import decode_entities, encode_key, meta_headers, nameable, presignable_key, tag
-from upstash_blob._multipart import MultipartOption, part_count, part_size_for, wants_multipart
+from upstash_blob._multipart import MultipartOption, part_concurrency_for, part_count, part_size_for, wants_multipart
 from upstash_blob._sniff import check_content_type, expand_content_types
 from upstash_blob._token import AGENT_URL
 from upstash_blob._units import CacheOption, Duration, Size, cache_control, over_limit, parse_duration, parse_size
@@ -63,6 +65,18 @@ from upstash_blob.types import (
 T = TypeVar("T")
 
 
+def _wait(seconds: float, cancel: Optional[threading.Event]) -> None:
+    """A backoff, cut short when ``cancel`` is set: a part whose upload already failed stops waiting."""
+    if cancel is None:
+        time.sleep(seconds)
+    else:
+        cancel.wait(seconds)
+
+
+class _Cancelled(Exception):
+    """A part stopped because another part of the same upload failed first."""
+
+
 class Bucket:
     """
     Synchronous client for one Upstash Blob bucket.
@@ -78,6 +92,7 @@ class Bucket:
         cache: Optional[CacheOption] = None,
         enable_telemetry: bool = True,
         http_client: Optional[httpx.Client] = None,
+        retry: Optional[RetryOption] = None,
     ) -> None:
         """
         :param token: The bucket token from the Upstash console.
@@ -87,8 +102,9 @@ class Bucket:
             requests. ``UPSTASH_DISABLE_TELEMETRY`` also turns it off.
         :param http_client: An ``httpx.Client`` to send requests with, for proxies or custom
             timeouts. The bucket does not close a client it was given.
+        :param retry: Retries for failed requests, or ``False`` to send each one once. See ``RetryConfig``.
         """
-        self._core = BucketCore(token, cache, enable_telemetry)
+        self._core = BucketCore(token, cache, enable_telemetry, retry)
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(timeout=DEFAULT_TIMEOUT)
 
@@ -100,12 +116,13 @@ class Bucket:
         cache: Optional[CacheOption] = None,
         enable_telemetry: bool = True,
         http_client: Optional[httpx.Client] = None,
+        retry: Optional[RetryOption] = None,
     ) -> "Bucket":
         """Reads the token from ``UPSTASH_BLOB_TOKEN``, or from the variable ``name``."""
         token = os.environ.get(name)
         if not token:
             raise TypeError(f"Bucket.from_env: {name} is not set")
-        return cls(token, cache=cache, enable_telemetry=enable_telemetry, http_client=http_client)
+        return cls(token, cache=cache, enable_telemetry=enable_telemetry, http_client=http_client, retry=retry)
 
     def close(self) -> None:
         if self._owns_client:
@@ -120,7 +137,9 @@ class Bucket:
     # ------------------------------------------------------------- transport
 
     def _mint(self) -> Credentials:
-        attempt = 0
+        policy = self._core._retry
+        dropped = 0
+        asked_again = 0
         while True:
             try:
                 res = self._client.post(
@@ -129,15 +148,15 @@ class Bucket:
             except httpx.TransportError as e:
                 # A dropped connection is asked again; a hung agent is not. No cause: the request
                 # being refused carries the bearer token.
-                if isinstance(e, httpx.TimeoutException) or attempt >= 2:
+                dropped += 1
+                if isinstance(e, httpx.TimeoutException) or dropped >= policy.attempts():
                     raise transport_error(e, "the credential service") from None
-                attempt += 1
-                time.sleep(backoff(attempt, None))
+                time.sleep(policy.wait(dropped, None))
                 continue
-            wait = mint_wait(res)
-            if wait is not None and attempt < 3:
-                attempt += 1
-                time.sleep(wait)
+            again, asked = mint_wait(res)
+            if again and asked_again < policy.mint_retries():
+                time.sleep(policy.mint_delay(asked_again, asked))
+                asked_again += 1
                 continue
             return credentials_from(res)
 
@@ -153,14 +172,17 @@ class Bucket:
         headers: Optional[Mapping[str, str]] = None,
         content: Any = None,
         stream: bool = False,
+        cancel: Optional[threading.Event] = None,
     ) -> httpx.Response:
         """
         A 5xx, a 429 and a dropped connection are retried for the verbs that can be sent twice
         safely; multipart complete and the batch delete are POSTs and are not among them. A streamed
-        body is never retried either: it has already been read once.
+        body is never retried either: it has already been read once. Once ``cancel`` is set, no
+        further attempt is made and a backoff ends early.
         """
+        policy = self._core._retry
         streaming = content is not None and not isinstance(content, (bytes, str))
-        attempts = RETRY_ATTEMPTS if not streaming and method in RETRIABLE_METHODS else 1
+        attempts = policy.attempts() if not streaming and method in RETRIABLE_METHODS else 1
         # A conditional write whose reply was lost may have landed, and sent again it would refuse
         # itself with a 412. Only answers that say it was not applied (429, 503) are asked again.
         conditional = is_conditional(headers)
@@ -168,6 +190,8 @@ class Bucket:
         attempt = 0
         while True:
             attempt += 1
+            if cancel is not None and cancel.is_set():
+                raise _Cancelled()
             creds = self._credentials()
             url, signed = self._core._signed(creds, method, path, query, headers)
             if method in ("GET", "HEAD"):
@@ -184,7 +208,7 @@ class Bucket:
                 unsent = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
                 if attempt >= attempts or (conditional and not unsent):
                     raise transport_error(e) from e
-                time.sleep(backoff(attempt, None))
+                _wait(policy.wait(attempt, None), cancel)
                 continue
             if res.status_code == 403:
                 # A HEAD carries no body to name the reason, so a credential that has visibly run out
@@ -192,7 +216,7 @@ class Bucket:
                 # sent again, but the next request still gets a fresh credential.
                 res.read()
                 if self._core._credential_expired() or CREDENTIAL_REJECTED.search(res.text):
-                    self._core._creds.invalidate()
+                    self._core._creds.invalidate(creds)
                     if not refreshed and not streaming:
                         refreshed = True
                         continue
@@ -202,7 +226,7 @@ class Bucket:
             )
             if attempt < attempts and unapplied:
                 res.close()
-                time.sleep(backoff(attempt, res.headers.get("retry-after")))
+                _wait(policy.wait(attempt, res.headers.get("retry-after")), cancel)
                 continue
             return res
 
@@ -221,6 +245,7 @@ class Bucket:
         it, so a url signed with it would hand its holder every object in the bucket.
         """
         payload = presign_payload(method, path, expires_in, headers, query, part)
+        policy = self._core._retry
         attempt = 0
         while True:
             attempt += 1
@@ -233,12 +258,12 @@ class Bucket:
                 )
             except httpx.TransportError as e:
                 # A hung agent is not asked again: three timeouts would hold a request for 30 s.
-                if isinstance(e, httpx.TimeoutException) or attempt >= RETRY_ATTEMPTS:
+                if isinstance(e, httpx.TimeoutException) or attempt >= policy.attempts():
                     raise BlobError("request_failed", "could not reach the signing service", status=502) from None
-                time.sleep(backoff(attempt, None))
+                time.sleep(policy.wait(attempt, None))
                 continue
-            if attempt < RETRY_ATTEMPTS and presign_retriable(res):
-                time.sleep(backoff(attempt, res.headers.get("retry-after")))
+            if attempt < policy.attempts() and presign_retriable(res):
+                time.sleep(policy.wait(attempt, res.headers.get("retry-after")))
                 continue
             return presigned_from(res)
 
@@ -411,41 +436,82 @@ class Bucket:
         self, path: str, data: _body.Data, size: int, headers: Mapping[str, str], content_type: str
     ) -> CompletedBlob:
         """
-        One part at a time: a part is buffered whole so it can be retried. An error anywhere aborts
-        the upload rather than leaving parts behind that nothing can see.
+        Up to four parts in flight, each buffered whole so it can be retried. Reading waits for a
+        free slot, so the body is never read further ahead than the parts being sent and the one
+        filling. An error stops the parts still in flight from retrying and waits for them, then
+        aborts the upload rather than leaving parts behind that nothing can see.
         """
         part_size = part_size_for(size)
         expected = part_count(size, part_size)
+        concurrency = part_concurrency_for(part_size)
         upload_id = self._create_multipart(path, headers)
+        cancel = threading.Event()
+        failures: List[BaseException] = []
+        etags: Dict[int, str] = {}
+
+        def send(n: int, chunk: bytes) -> None:
+            res = self._fetch(
+                "PUT",
+                path,
+                query={"partNumber": str(n), "uploadId": upload_id},
+                headers={"content-length": str(len(chunk))},
+                content=chunk,
+                cancel=cancel,
+            )
+            if not res.is_success:
+                raise error_from_body(res.status_code, res.text)
+            etag = res.headers.get("etag")
+            if not etag:
+                raise BlobError("request_failed", f"part {n} landed without an etag", status=502)
+            etags[n] = etag
+
+        def settle(done: "Future[None]") -> None:
+            error = done.exception()
+            # The first failure is the one reported; the parts it cancelled report nothing.
+            if error is not None and not isinstance(error, _Cancelled):
+                if not failures:
+                    failures.append(error)
+                cancel.set()
+
+        pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="upstash-blob-part")
+        inflight: Set[Future[None]] = set()
+        parts = _body.parts_of(data, part_size)
         try:
-            parts: List[Tuple[int, str]] = []
             sent = 0
-            for chunk in _body.parts_of(data, part_size):
-                n = len(parts) + 1
+            n = 0
+            for chunk in parts:
+                if failures:
+                    break
+                n += 1
                 if n > expected:
                     raise BlobError("invalid_input", f"body is longer than the declared {size} bytes")
-                res = self._fetch(
-                    "PUT",
-                    path,
-                    query={"partNumber": str(n), "uploadId": upload_id},
-                    headers={"content-length": str(len(chunk))},
-                    content=chunk,
-                )
-                if not res.is_success:
-                    raise error_from_body(res.status_code, res.text)
-                etag = res.headers.get("etag")
-                if not etag:
-                    raise BlobError("request_failed", f"part {n} landed without an etag", status=502)
-                parts.append((n, etag))
+                future = pool.submit(send, n, chunk)
+                future.add_done_callback(settle)
+                inflight.add(future)
                 sent += len(chunk)
+                del chunk
+                while len(inflight) >= concurrency and not failures:
+                    _, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+            wait(inflight)
+            if failures:
+                raise failures[0]
             if sent != size:
                 raise BlobError("invalid_input", f"body was {sent} bytes, {size} were declared")
-            etag = self._complete_multipart(path, upload_id, parts)
-        except BaseException:
+            etag = self._complete_multipart(path, upload_id, sorted(etags.items()))
+        except BaseException as e:
+            # A part still in flight would land after the abort and be billed with nothing to list it.
+            cancel.set()
+            wait(inflight)
+            pool.shutdown()
+            parts.close()
             # Nothing lists an incomplete upload, so a failure that left one behind is invisible billing.
             with contextlib.suppress(Exception):
                 self._abort_multipart(path, upload_id)
+            if failures and failures[0] is not e and isinstance(e, Exception):
+                raise failures[0] from None
             raise
+        finally:
+            pool.shutdown()
         blob = self._core._blob(path, size, etag, datetime.now(timezone.utc))
         return CompletedBlob(**vars(blob), content_type=content_type)
 

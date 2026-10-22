@@ -18,10 +18,13 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+
+import httpx
 
 from upstash_blob._core import safe_content_type
 from upstash_blob._keys import presignable_key
@@ -515,6 +518,8 @@ class Grant:
     """Storage's multipart id. None for a single PUT: there is no upload to complete or abort."""
     part_size: int
     """The part size for a multipart, and the whole file for a single PUT, so one part covers it."""
+    owner: Optional[str] = None
+    """The handler's ``owner`` of whoever began the upload; every later request must match it."""
 
     @property
     def file(self) -> FileInfo:
@@ -544,6 +549,8 @@ def sign_grant(g: Grant, key: str) -> str:
     }
     if g.upload_id is not None:
         payload["uploadId"] = g.upload_id
+    if g.owner is not None:
+        payload["o"] = g.owner
     try:
         raw = json.dumps(payload, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
@@ -576,6 +583,7 @@ def verify_grant(token: str, key: str) -> Optional[Grant]:
             exp=p["exp"],
             upload_id=upload_id,
             part_size=p["partSize"],
+            owner=p.get("o"),
         )
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
@@ -586,11 +594,15 @@ def verify_grant(token: str, key: str) -> Optional[Grant]:
         and all(_int(n) is not None for n in (grant.size, grant.exp, grant.part_size))
         and grant.part_size > 0
         and (upload_id is None or isinstance(upload_id, str))
+        and (grant.owner is None or isinstance(grant.owner, str))
     )
     return grant if ok else None
 
 
-def check_grant(token: Any, key: str, bucket_id: str, route: str, details: Details) -> Grant:
+def check_grant(
+    token: Any, key: str, bucket_id: str, route: str, details: Details, owner: Optional[str] = None
+) -> Grant:
+    """``owner`` is who sent this request, when the handler binds uploads to one; None when it does not."""
     if not isinstance(token, str):
         raise BlobError("invalid_input", "completionToken is required")
     g = verify_grant(token, key)
@@ -598,9 +610,34 @@ def check_grant(token: Any, key: str, bucket_id: str, route: str, details: Detai
         raise BlobError("forbidden", "completionToken is not valid for this route")
     if g.exp < time.time() * 1000:
         raise BlobError("forbidden", "completionToken has expired")
+    # A token is a bearer capability, so without this anyone signed in who holds one could finish,
+    # re-sign or cancel somebody else's upload. Checked before storage or any callback is touched,
+    # and before details names the path, so a refusal tells the caller nothing about the upload.
+    if owner is not None and g.owner != owner:
+        raise BlobError("forbidden", "this upload belongs to another user")
     details.path = g.path
     details.state = g.state
     return g
+
+
+def owner_string(value: Any) -> str:
+    """
+    What the handler's ``owner`` returned, as the string signed into the token. A session lookup
+    that found nobody reads as ``user.id if user else None``: that is a 401, never an upload owned
+    by "None".
+    """
+    if value is None or value == "":
+        raise BlobError("unauthorized", "no signed-in user to own this upload")
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise TypeError(f"owner must return a str or an int, got {type(value).__name__}")
+    return str(value)
+
+
+def check_owner_option(owner: Optional[Callback], context: Optional[Callback]) -> None:
+    if owner is not None and context is None:
+        raise TypeError("owner reads ctx, so it needs a context")
+    if owner is not None and not callable(owner):
+        raise TypeError("owner must be a function of ctx")
 
 
 def token_expiry() -> int:
@@ -746,3 +783,73 @@ def plan_parts(g: Grant, start: int) -> List[Tuple[int, int]]:
 
 def part_count(g: Grant) -> int:
     return max(1, math.ceil(g.size / g.part_size))
+
+
+# --------------------------------------------------------------- CORS probe
+
+# Origins remembered as probed. Bounded, since the Origin header is the client's to choose.
+_MAX_PROBED = 64
+_PROBE_TIMEOUT = 5.0
+_PROBE_ORIGIN = re.compile(r"https?://[^/]+", re.IGNORECASE | re.ASCII)
+
+
+class CorsProbe:
+    """
+    A browser upload PUTs straight to storage, so a bucket whose CORS list leaves out the page's
+    origin fails in the browser alone: the route answers 200, a curl against it succeeds, and the
+    only trace is a console error in a tab nobody is watching. The token cannot read the bucket's
+    CORS rules, but storage answers a preflight for anybody, so the handler sends the preflight the
+    browser is about to send, against the url it just signed, and logs a warning when storage
+    refuses it. Diagnostic only: never awaited by the request, never raised, once per origin.
+    """
+
+    def __init__(self) -> None:
+        self._probed: Set[str] = set()
+        self._lock = threading.Lock()
+
+    def claim(self, origin: Optional[str]) -> Optional[str]:
+        """The origin to probe now, or None when there is nothing to ask or it was asked already."""
+        if not origin or not _PROBE_ORIGIN.fullmatch(origin):
+            return None
+        with self._lock:
+            if origin in self._probed:
+                return None
+            # Forgetting is the cheap way to stay bounded: a forgotten origin is only probed once more.
+            if len(self._probed) >= _MAX_PROBED:
+                self._probed.clear()
+            self._probed.add(origin)
+        return origin
+
+    def settle(self, origin: str, allowed: Optional[bool]) -> None:
+        if allowed is None:
+            # Storage that could not be asked is asked again on the next upload from this origin.
+            with self._lock:
+                self._probed.discard(origin)
+        elif not allowed:
+            logger.warning(cors_warning(origin))
+
+    @staticmethod
+    def request(origin: str, url: str, headers: Optional[Mapping[str, str]]) -> Dict[str, Any]:
+        """The keyword arguments for the preflight ``httpx`` request."""
+        names = sorted(k.lower() for k in (headers or {}))
+        out = {"origin": origin, "access-control-request-method": "PUT"}
+        if names:
+            out["access-control-request-headers"] = ",".join(names)
+        return {"method": "OPTIONS", "url": url, "headers": out, "timeout": _PROBE_TIMEOUT}
+
+    @staticmethod
+    def verdict(origin: str, res: httpx.Response) -> Optional[bool]:
+        """True or False when storage answered the preflight; None when it did not answer the question."""
+        # A 5xx or a rate limit is storage not answering, not a refusal.
+        if res.status_code >= 500 or res.status_code == 429:
+            return None
+        allowed = res.headers.get("access-control-allow-origin")
+        return res.is_success and allowed in ("*", origin)
+
+
+def cors_warning(origin: str) -> str:
+    return (
+        f"storage refused the CORS preflight from {origin}, so a browser upload from that origin will be "
+        f"blocked before any bytes are sent. If {origin} is your app, add it to the bucket's CORS origins "
+        "in the Upstash Console, under the bucket's CORS settings."
+    )

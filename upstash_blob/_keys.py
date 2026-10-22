@@ -78,6 +78,14 @@ def meta_headers(metadata: Optional[Mapping[str, str]]) -> Dict[str, str]:
     for k, v in (metadata or {}).items():
         if not isinstance(k, str) or not _HEADER_NAME.fullmatch(k):
             raise BlobError("invalid_input", f'metadata key "{k}" is not a valid header name')
+        # Storage hands keys back lowercased, so "recordId" would be written and "recordid" read back:
+        # refused here, where it is the caller's mistake, rather than as a missing key much later.
+        if k != k.lower():
+            raise BlobError(
+                "invalid_input",
+                f'metadata key "{k}" must be lowercase',
+                hint=f'storage returns keys lowercased; write "{k.lower()}"',
+            )
         if not isinstance(v, str):
             raise BlobError("invalid_input", f"metadata.{k} must be a string")
         # h11 refuses a value with leading or trailing whitespace, which fetch would trim silently.
@@ -87,5 +95,5 @@ def meta_headers(metadata: Optional[Mapping[str, str]]) -> Dict[str, str]:
                 f"metadata.{k} has characters storage does not carry back unchanged",
                 hint="metadata is printable ASCII; percent-encode anything else with urllib.parse.quote",
             )
-        out[f"x-amz-meta-{k.lower()}"] = v
+        out[f"x-amz-meta-{k}"] = v
     return out

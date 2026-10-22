@@ -10,7 +10,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, TypedDict, Union
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -33,6 +33,7 @@ DEFAULT_READ_SECONDS = 300
 
 RETRIABLE_METHODS = {"GET", "HEAD", "PUT", "DELETE"}
 RETRY_ATTEMPTS = 3
+MINT_RETRIES = 3
 
 # R2 answers a temporary credential that has expired with a 403 naming it, which is
 # indistinguishable from a signature error unless the body is read.
@@ -45,6 +46,8 @@ AGENT_TIMEOUT = 10.0
 _REFRESH_MARGIN_S = 30.0
 # A Retry-After longer than this is the agent asking for a pause no request can wait out.
 _MAX_MINT_WAIT_S = 10.0
+# What a 429 or 503 from the agent waits when it names no Retry-After.
+_DEFAULT_MINT_WAIT_S = 2.0
 
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
@@ -92,19 +95,23 @@ def agent_headers(token: str, telemetry: bool) -> Dict[str, str]:
     return {"authorization": f"Bearer {token}", **(telemetry_headers() if telemetry else {})}
 
 
-def mint_wait(res: httpx.Response) -> Optional[float]:
-    """For a 429 or 503: how long the agent asked to wait. Raises when it is longer than a request can."""
+def mint_wait(res: httpx.Response) -> Tuple[bool, Optional[float]]:
+    """
+    For a 429 or 503: whether to wait and ask again, and how long the agent asked for (None when it
+    named no positive Retry-After). Raises when it asked for longer than a request can wait.
+    """
     if res.status_code not in (429, 503):
-        return None
+        return False, None
     try:
         parsed = float(res.headers.get("retry-after", ""))
     except ValueError:
         parsed = 0.0
-    # A missing Retry-After would otherwise retry immediately, three times.
-    asked = parsed if parsed > 0 else 2.0
-    if asked > _MAX_MINT_WAIT_S:
-        raise BlobError("mint_backoff", f"the credential service asked for {asked:g}s of backoff", retry_after=asked)
-    return asked
+    if not math.isfinite(parsed) or parsed <= 0:
+        # A missing Retry-After would otherwise retry immediately, three times: the policy's wait applies.
+        return True, None
+    if parsed > _MAX_MINT_WAIT_S:
+        raise BlobError("mint_backoff", f"the credential service asked for {parsed:g}s of backoff", retry_after=parsed)
+    return True, parsed
 
 
 def credentials_from(res: httpx.Response) -> Credentials:
@@ -162,11 +169,15 @@ class CredentialCache:
         """The cached credential, without minting one. None before the first mint."""
         return self._current
 
-    def invalidate(self) -> None:
+    def invalidate(self, stale: Optional[Credentials] = None) -> None:
         """
         After a 403 that named the credential itself: the next get() mints. The credential stays
         peekable, since its visibility is still true and a private bucket must not look public.
+        Given the credential the request was signed with, a newer one is kept, so parts refused
+        together re-mint once rather than each throwing away the credential the first one fetched.
         """
+        if stale is not None and self._current is not stale:
+            return
         self._refresh_at = 0.0
 
     def _store(self, creds: Credentials) -> Credentials:
@@ -292,18 +303,105 @@ def presigned_from(res: httpx.Response) -> Tuple[str, datetime]:
         raise unexpected from None
 
 
+# -------------------------------------------------------------------- retry
+
+
+class RetryConfig(TypedDict, total=False):
+    """
+    How the bucket retries a failed request: a 5xx, a 429 or a dropped connection on a request that
+    is safe to send twice, a signing call, and a credential the service asked to wait for.
+    ``retry=False`` sends everything once.
+    """
+
+    retries: int
+    """Retries after the first attempt. Default 2 for object and signing requests, 3 for a credential."""
+    backoff: Callable[[int], float]
+    """
+    Milliseconds to wait before retry ``retry_count``, counted from 0. A Retry-After from the service
+    wins over it. Default: full jitter, doubling from 200 ms and capped at 4 s; 2 s for a credential.
+    """
+
+
+RetryOption = Union[Literal[False], RetryConfig]
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """``RetryOption`` with the shorthand resolved, so every retry loop reads the same two fields."""
+
+    retries: Optional[int] = None
+    backoff: Optional[Callable[[int], float]] = None
+
+    def attempts(self) -> int:
+        """Attempts in all for an object or signing request."""
+        return (RETRY_ATTEMPTS - 1 if self.retries is None else self.retries) + 1
+
+    def mint_retries(self) -> int:
+        return MINT_RETRIES if self.retries is None else self.retries
+
+    def wait(self, attempt: int, retry_after: Optional[str]) -> float:
+        """Seconds to wait after failed attempt ``attempt`` (from 1). A Retry-After wins over a custom backoff."""
+        if self.backoff is None or _retry_after_seconds(retry_after) is not None:
+            return backoff(attempt, retry_after)
+        return wait_seconds(self.backoff(attempt - 1))
+
+    def mint_delay(self, retry: int, asked: Optional[float]) -> float:
+        """Seconds before credential retry ``retry`` (from 0): what the service asked, else the backoff, else 2 s."""
+        if asked is not None:
+            return asked
+        if self.backoff is not None:
+            return wait_seconds(self.backoff(retry))
+        return _DEFAULT_MINT_WAIT_S
+
+
+def retry_policy(option: Optional[RetryOption]) -> RetryPolicy:
+    if option is None:
+        return RetryPolicy()
+    if option is False:
+        return RetryPolicy(retries=0)
+    if not isinstance(option, dict):
+        raise TypeError("retry: expected False or {'retries': ..., 'backoff': ...}")
+    unknown = set(option) - {"retries", "backoff"}
+    if unknown:
+        raise TypeError(f"retry: unknown key {sorted(unknown)[0]!r}")
+    retries = option.get("retries")
+    fn = option.get("backoff")
+    if retries is not None and (isinstance(retries, bool) or not isinstance(retries, int) or retries < 0):
+        raise TypeError(f"retry['retries']: expected a whole number of 0 or more, got {retries!r}")
+    if fn is not None and not callable(fn):
+        raise TypeError("retry['backoff']: expected a function")
+    return RetryPolicy(retries, fn)
+
+
+# Past this, time.sleep and asyncio's timers overflow rather than wait.
+_MAX_WAIT_S = 2**31 / 1000
+
+
+def wait_seconds(ms: Any) -> float:
+    """A caller's backoff, in milliseconds, as a sleep: anything but a positive number is no wait."""
+    if isinstance(ms, bool) or not isinstance(ms, (int, float)) or not math.isfinite(ms) or ms <= 0:
+        return 0.0
+    return min(ms / 1000, _MAX_WAIT_S)
+
+
+def _retry_after_seconds(retry_after: Optional[str]) -> Optional[float]:
+    if not retry_after:
+        return None
+    try:
+        secs = float(retry_after)
+    except ValueError:
+        return None
+    return secs if math.isfinite(secs) and secs >= 0 else None
+
+
 # ---------------------------------------------------------------- responses
 
 
 def backoff(attempt: int, retry_after: Optional[str], base: float = 0.2) -> float:
     """Full jitter, doubling from ``base`` seconds per attempt and capped at 4 s; Retry-After wins."""
-    if retry_after:
-        try:
-            secs = float(retry_after)
-            if secs >= 0:
-                return min(secs, 10.0)
-        except ValueError:
-            pass
+    secs = _retry_after_seconds(retry_after)
+    if secs is not None:
+        return min(secs, 10.0)
     return random.random() * min(4.0, base * 2.0**attempt)
 
 
@@ -520,9 +618,16 @@ def safe_content_type(content_type: str) -> str:
 class BucketCore:
     """Token, credential cache and the pure half of every request, shared by both buckets."""
 
-    def __init__(self, token: str, cache: Optional[CacheOption], enable_telemetry: bool) -> None:
+    def __init__(
+        self,
+        token: str,
+        cache: Optional[CacheOption],
+        enable_telemetry: bool,
+        retry: Optional[RetryOption] = None,
+    ) -> None:
         if not isinstance(token, str) or not token:
             raise TypeError("Bucket(token): token is required")
+        self._retry = retry_policy(retry)
         # A token read from a secret file often ends in a newline, which no header can carry.
         token = token.strip()
         decoded = decode_token(token)

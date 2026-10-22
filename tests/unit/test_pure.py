@@ -71,8 +71,8 @@ class TestKeys:
             assert e.value.code == "invalid_input"
 
     def test_metadata_is_printable_ascii(self) -> None:
-        assert meta_headers({"Owner": "u1"}) == {"x-amz-meta-owner": "u1"}
-        for bad in ({"note": "café"}, {"note": "a\r\nb"}, {"bad key": "x"}, {"k": 1}):
+        assert meta_headers({"owner": "u1"}) == {"x-amz-meta-owner": "u1"}
+        for bad in ({"note": "café"}, {"note": "a\r\nb"}, {"bad key": "x"}, {"k": 1}, {"recordId": "x"}):
             with pytest.raises(BlobError) as e:
                 meta_headers(bad)  # type: ignore[arg-type]
             assert e.value.code == "invalid_input"

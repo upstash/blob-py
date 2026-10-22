@@ -5,9 +5,11 @@ import os
 from dataclasses import dataclass
 from typing import (
     Any,
+    AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
     Callable,
+    Generator,
     Iterable,
     Iterator,
     Optional,
@@ -251,7 +253,7 @@ def exact(data: Data, size: int) -> Data:
     return counted(data)
 
 
-def parts_of(data: Data, part_size: int) -> Iterator[bytes]:
+def parts_of(data: Data, part_size: int) -> Generator[bytes, None, None]:
     """Exactly part_size bytes per part, the last one whatever is left."""
     if isinstance(data, bytes):
         view = memoryview(data)
@@ -336,7 +338,7 @@ def aexact(data: AsyncData, size: int) -> AsyncData:
     return counted(data)
 
 
-async def aparts_of(data: AsyncData, part_size: int) -> AsyncIterator[bytes]:
+async def aparts_of(data: AsyncData, part_size: int) -> AsyncGenerator[bytes, None]:
     if isinstance(data, bytes):
         for part in parts_of(data, part_size):
             yield part

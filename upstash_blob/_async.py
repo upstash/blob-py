@@ -5,7 +5,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, TypeVar, Union
 
 import httpx
 
@@ -17,11 +17,11 @@ from upstash_blob._core import (
     DEFAULT_TIMEOUT,
     MAX_PRESIGN_SECONDS,
     RETRIABLE_METHODS,
-    RETRY_ATTEMPTS,
     TOKEN_ENV,
     BucketCore,
     Credentials,
     Head,
+    RetryOption,
     attachment_disposition,
     backoff,
     check_etag,
@@ -44,7 +44,7 @@ from upstash_blob._core import (
     transport_error,
 )
 from upstash_blob._keys import decode_entities, encode_key, meta_headers, nameable, presignable_key, tag
-from upstash_blob._multipart import MultipartOption, part_count, part_size_for, wants_multipart
+from upstash_blob._multipart import MultipartOption, part_concurrency_for, part_count, part_size_for, wants_multipart
 from upstash_blob._sniff import check_content_type, expand_content_types
 from upstash_blob._token import AGENT_URL
 from upstash_blob._units import CacheOption, Duration, Size, cache_control, over_limit, parse_duration, parse_size
@@ -80,6 +80,7 @@ class AsyncBucket:
         cache: Optional[CacheOption] = None,
         enable_telemetry: bool = True,
         http_client: Optional[httpx.AsyncClient] = None,
+        retry: Optional[RetryOption] = None,
     ) -> None:
         """
         :param token: The bucket token from the Upstash console.
@@ -89,8 +90,9 @@ class AsyncBucket:
             requests. ``UPSTASH_DISABLE_TELEMETRY`` also turns it off.
         :param http_client: An ``httpx.AsyncClient`` to send requests with, for proxies or custom
             timeouts. The bucket does not close a client it was given.
+        :param retry: Retries for failed requests, or ``False`` to send each one once. See ``RetryConfig``.
         """
-        self._core = BucketCore(token, cache, enable_telemetry)
+        self._core = BucketCore(token, cache, enable_telemetry, retry)
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
 
@@ -102,12 +104,13 @@ class AsyncBucket:
         cache: Optional[CacheOption] = None,
         enable_telemetry: bool = True,
         http_client: Optional[httpx.AsyncClient] = None,
+        retry: Optional[RetryOption] = None,
     ) -> "AsyncBucket":
         """Reads the token from ``UPSTASH_BLOB_TOKEN``, or from the variable ``name``."""
         token = os.environ.get(name)
         if not token:
             raise TypeError(f"AsyncBucket.from_env: {name} is not set")
-        return cls(token, cache=cache, enable_telemetry=enable_telemetry, http_client=http_client)
+        return cls(token, cache=cache, enable_telemetry=enable_telemetry, http_client=http_client, retry=retry)
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -122,7 +125,9 @@ class AsyncBucket:
     # ------------------------------------------------------------- transport
 
     async def _mint(self) -> Credentials:
-        attempt = 0
+        policy = self._core._retry
+        dropped = 0
+        asked_again = 0
         while True:
             try:
                 res = await self._client.post(
@@ -131,15 +136,15 @@ class AsyncBucket:
             except httpx.TransportError as e:
                 # A dropped connection is asked again; a hung agent is not. No cause: the request
                 # being refused carries the bearer token.
-                if isinstance(e, httpx.TimeoutException) or attempt >= 2:
+                dropped += 1
+                if isinstance(e, httpx.TimeoutException) or dropped >= policy.attempts():
                     raise transport_error(e, "the credential service") from None
-                attempt += 1
-                await asyncio.sleep(backoff(attempt, None))
+                await asyncio.sleep(policy.wait(dropped, None))
                 continue
-            wait = mint_wait(res)
-            if wait is not None and attempt < 3:
-                attempt += 1
-                await asyncio.sleep(wait)
+            again, asked = mint_wait(res)
+            if again and asked_again < policy.mint_retries():
+                await asyncio.sleep(policy.mint_delay(asked_again, asked))
+                asked_again += 1
                 continue
             return credentials_from(res)
 
@@ -161,8 +166,9 @@ class AsyncBucket:
         safely; multipart complete and the batch delete are POSTs and are not among them. A streamed
         body is never retried either: it has already been read once.
         """
+        policy = self._core._retry
         streaming = content is not None and not isinstance(content, (bytes, str))
-        attempts = RETRY_ATTEMPTS if not streaming and method in RETRIABLE_METHODS else 1
+        attempts = policy.attempts() if not streaming and method in RETRIABLE_METHODS else 1
         # A conditional write whose reply was lost may have landed, and sent again it would refuse
         # itself with a 412. Only answers that say it was not applied (429, 503) are asked again.
         conditional = is_conditional(headers)
@@ -186,7 +192,7 @@ class AsyncBucket:
                 unsent = isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
                 if attempt >= attempts or (conditional and not unsent):
                     raise transport_error(e) from e
-                await asyncio.sleep(backoff(attempt, None))
+                await asyncio.sleep(policy.wait(attempt, None))
                 continue
             if res.status_code == 403:
                 # A HEAD carries no body to name the reason, so a credential that has visibly run out
@@ -194,7 +200,7 @@ class AsyncBucket:
                 # sent again, but the next request still gets a fresh credential.
                 await res.aread()
                 if self._core._credential_expired() or CREDENTIAL_REJECTED.search(res.text):
-                    self._core._creds.invalidate()
+                    self._core._creds.invalidate(creds)
                     if not refreshed and not streaming:
                         refreshed = True
                         continue
@@ -204,7 +210,7 @@ class AsyncBucket:
             )
             if attempt < attempts and unapplied:
                 await res.aclose()
-                await asyncio.sleep(backoff(attempt, res.headers.get("retry-after")))
+                await asyncio.sleep(policy.wait(attempt, res.headers.get("retry-after")))
                 continue
             return res
 
@@ -223,6 +229,7 @@ class AsyncBucket:
         it, so a url signed with it would hand its holder every object in the bucket.
         """
         payload = presign_payload(method, path, expires_in, headers, query, part)
+        policy = self._core._retry
         attempt = 0
         while True:
             attempt += 1
@@ -235,12 +242,12 @@ class AsyncBucket:
                 )
             except httpx.TransportError as e:
                 # A hung agent is not asked again: three timeouts would hold a request for 30 s.
-                if isinstance(e, httpx.TimeoutException) or attempt >= RETRY_ATTEMPTS:
+                if isinstance(e, httpx.TimeoutException) or attempt >= policy.attempts():
                     raise BlobError("request_failed", "could not reach the signing service", status=502) from None
-                await asyncio.sleep(backoff(attempt, None))
+                await asyncio.sleep(policy.wait(attempt, None))
                 continue
-            if attempt < RETRY_ATTEMPTS and presign_retriable(res):
-                await asyncio.sleep(backoff(attempt, res.headers.get("retry-after")))
+            if attempt < policy.attempts() and presign_retriable(res):
+                await asyncio.sleep(policy.wait(attempt, res.headers.get("retry-after")))
                 continue
             return presigned_from(res)
 
@@ -415,41 +422,103 @@ class AsyncBucket:
         self, path: str, data: _body.AsyncData, size: int, headers: Mapping[str, str], content_type: str
     ) -> CompletedBlob:
         """
-        One part at a time: a part is buffered whole so it can be retried. An error anywhere aborts
-        the upload rather than leaving parts behind that nothing can see.
+        Up to four parts in flight, each buffered whole so it can be retried. Reading waits for a
+        free slot, so the body is never read further ahead than the parts being sent and the one
+        filling. An error cancels the parts still in flight, a read of a slow body included, and
+        waits for them, then aborts the upload rather than leaving parts behind that nothing can see.
         """
         part_size = part_size_for(size)
         expected = part_count(size, part_size)
+        concurrency = part_concurrency_for(part_size)
         upload_id = await self._create_multipart(path, headers)
+        etags: Dict[int, str] = {}
+        failed = asyncio.Event()
+        failures: List[BaseException] = []
+
+        async def send(n: int, chunk: bytes) -> None:
+            res = await self._fetch(
+                "PUT",
+                path,
+                query={"partNumber": str(n), "uploadId": upload_id},
+                headers={"content-length": str(len(chunk))},
+                content=chunk,
+            )
+            if not res.is_success:
+                raise error_from_body(res.status_code, res.text)
+            etag = res.headers.get("etag")
+            if not etag:
+                raise BlobError("request_failed", f"part {n} landed without an etag", status=502)
+            etags[n] = etag
+
+        def settle(task: "asyncio.Task[None]") -> None:
+            if task.cancelled():
+                return
+            error = task.exception()
+            # The first failure is the one reported; the parts it cancelled report nothing.
+            if error is not None and not failures:
+                failures.append(error)
+                failed.set()
+
+        async def until_failed() -> None:
+            await failed.wait()
+
+        inflight: Set[asyncio.Task[None]] = set()
+        watcher = asyncio.ensure_future(until_failed())
+        parts = _body.aparts_of(data, part_size)
+        read: Optional[asyncio.Future[bytes]] = None
         try:
-            parts: List[Tuple[int, str]] = []
             sent = 0
-            async for chunk in _body.aparts_of(data, part_size):
-                n = len(parts) + 1
+            n = 0
+            while True:
+                # Raced against a failure, so a slow body does not hold up the answer to a failed part.
+                read = asyncio.ensure_future(parts.__anext__())
+                await asyncio.wait({read, watcher}, return_when=asyncio.FIRST_COMPLETED)
+                if failures:
+                    read.cancel()
+                    with contextlib.suppress(BaseException):
+                        await read
+                    break
+                try:
+                    chunk = read.result()
+                except StopAsyncIteration:
+                    break
+                n += 1
                 if n > expected:
                     raise BlobError("invalid_input", f"body is longer than the declared {size} bytes")
-                res = await self._fetch(
-                    "PUT",
-                    path,
-                    query={"partNumber": str(n), "uploadId": upload_id},
-                    headers={"content-length": str(len(chunk))},
-                    content=chunk,
-                )
-                if not res.is_success:
-                    raise error_from_body(res.status_code, res.text)
-                etag = res.headers.get("etag")
-                if not etag:
-                    raise BlobError("request_failed", f"part {n} landed without an etag", status=502)
-                parts.append((n, etag))
+                task = asyncio.ensure_future(send(n, chunk))
+                task.add_done_callback(settle)
+                inflight.add(task)
                 sent += len(chunk)
+                del chunk
+                while len(inflight) >= concurrency and not failures:
+                    _, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+            if inflight and not failures:
+                await asyncio.wait(inflight)
+            if failures:
+                raise failures[0]
             if sent != size:
                 raise BlobError("invalid_input", f"body was {sent} bytes, {size} were declared")
-            etag = await self._complete_multipart(path, upload_id, parts)
-        except BaseException:
+            etag = await self._complete_multipart(path, upload_id, sorted(etags.items()))
+        except BaseException as e:
+            # A part still in flight would land after the abort and be billed with nothing to list it.
+            if read is not None and not read.done():
+                read.cancel()
+                with contextlib.suppress(BaseException):
+                    await read
+            for t in inflight:
+                t.cancel()
+            if inflight:
+                await asyncio.wait(inflight)
+            with contextlib.suppress(Exception):
+                await parts.aclose()
             # Nothing lists an incomplete upload, so a failure that left one behind is invisible billing.
             with contextlib.suppress(Exception):
                 await self._abort_multipart(path, upload_id)
+            if failures and failures[0] is not e and isinstance(e, Exception):
+                raise failures[0] from None
             raise
+        finally:
+            watcher.cancel()
         blob = self._core._blob(path, size, etag, datetime.now(timezone.utc))
         return CompletedBlob(**vars(blob), content_type=content_type)
 
