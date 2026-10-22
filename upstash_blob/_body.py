@@ -253,6 +253,17 @@ def exact(data: Data, size: int) -> Data:
     return counted(data)
 
 
+def _take(buf: bytearray, n: int) -> bytes:
+    """
+    The first n bytes, removed from buf before they are handed over: a part waiting for a free slot
+    is the only copy of itself, rather than one more held behind it in buf.
+    """
+    with memoryview(buf) as view:
+        part = bytes(view[:n])
+    del buf[:n]
+    return part
+
+
 def parts_of(data: Data, part_size: int) -> Generator[bytes, None, None]:
     """Exactly part_size bytes per part, the last one whatever is left."""
     if isinstance(data, bytes):
@@ -264,8 +275,7 @@ def parts_of(data: Data, part_size: int) -> Generator[bytes, None, None]:
     for chunk in data:
         buf += chunk
         while len(buf) >= part_size:
-            yield bytes(buf[:part_size])
-            del buf[:part_size]
+            yield _take(buf, part_size)
     if buf:
         yield bytes(buf)
 
@@ -347,7 +357,6 @@ async def aparts_of(data: AsyncData, part_size: int) -> AsyncGenerator[bytes, No
     async for chunk in data:
         buf += chunk
         while len(buf) >= part_size:
-            yield bytes(buf[:part_size])
-            del buf[:part_size]
+            yield _take(buf, part_size)
     if buf:
         yield bytes(buf)

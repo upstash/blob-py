@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -766,7 +767,7 @@ class TestParallelParts:
     def test_concurrency_shrinks_with_the_part_size(self) -> None:
         from upstash_blob._multipart import part_concurrency_for
 
-        sizes = [5, 16, 17, 21, 22, 32, 33, 40]
+        sizes = [5, 12, 13, 16, 17, 21, 22, 40]
         assert [part_concurrency_for(s * MIB) for s in sizes] == [4, 4, 3, 3, 2, 2, 1, 1]
 
     def test_four_parts_are_in_flight_at_once(self, fake: Fake, bucket: Bucket) -> None:
@@ -895,38 +896,40 @@ class TestParallelParts:
         await ab.put("apar.bin", data, multipart=True)
         assert fake.objects["apar.bin"].data == data and not fake.uploads
 
-    async def test_async_a_failed_part_does_not_wait_for_a_slow_body(self, fake: Fake, abucket: AsyncBucket) -> None:
+    @pytest.mark.skipif(sys.version_info < (3, 11), reason="asyncio.timeout is 3.11+")
+    async def test_async_a_timeout_the_body_holds_across_its_yields_still_applies(
+        self, fake: Fake, abucket: AsyncBucket
+    ) -> None:
         import asyncio
-
-        fake.intercept = lambda r: error(400, "BadDigest") if is_part(r) else None
+        import time
 
         async def body() -> Any:
-            yield b"x" * (5 * MIB)
-            await asyncio.Event().wait()  # never sends the rest
-            yield b""
+            async with asyncio.timeout(0.3):
+                yield b"x" * (5 * MIB)
+                await asyncio.Event().wait()  # the source stalls
+                yield b""
 
-        with pytest.raises(BlobError) as e:
+        began = time.monotonic()
+        with pytest.raises(TimeoutError):
             await asyncio.wait_for(abucket.put("slow.bin", body(), size=20 * MIB, multipart=True), 5)
-        assert e.value.status == 400
+        assert time.monotonic() - began < 2  # the body's own 0.3 s, not the 5 s guard
         assert not fake.uploads
 
+    def test_parts_run_in_the_callers_context(self, fake: Fake, bucket: Bucket) -> None:
+        import contextvars
 
-async def test_async_a_failed_part_cancels_the_rest_after_the_body_ends(fake: Fake) -> None:
-    import asyncio
+        trace = contextvars.ContextVar("trace", default="none")
+        seen = []
 
-    never = asyncio.Event()
+        def record(r: httpx.Request) -> Optional[httpx.Response]:
+            if is_part(r):
+                seen.append(trace.get())
+            return None
 
-    async def handler(r: httpx.Request) -> httpx.Response:
-        if is_part(r):
-            if r.url.params["partNumber"] == "3":
-                return error(400, "BadDigest")
-            await never.wait()  # parts 1 and 2 hang until cancelled
-        return await fake.ahandler(r)
-
-    ab = AsyncBucket(TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    with pytest.raises(BlobError) as e:
-        await asyncio.wait_for(ab.put("drain.bin", b"d" * (12 * MIB), multipart=True), 5)
-    assert e.value.status == 400 and not fake.uploads
+        fake.intercept = record
+        trace.set("req-7")
+        bucket.put("ctx.bin", b"c" * (11 * MIB), multipart=True)
+        assert seen == ["req-7"] * 3
 
 
 class TestMetadataKeys:

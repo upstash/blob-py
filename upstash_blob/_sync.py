@@ -1,4 +1,5 @@
 import contextlib
+import contextvars
 import json
 import os
 import threading
@@ -193,6 +194,9 @@ class Bucket:
             if cancel is not None and cancel.is_set():
                 raise _Cancelled()
             creds = self._credentials()
+            # A credential can take seconds to mint; a part cancelled meanwhile is not sent after all.
+            if cancel is not None and cancel.is_set():
+                raise _Cancelled()
             url, signed = self._core._signed(creds, method, path, query, headers)
             if method in ("GET", "HEAD"):
                 # httpx otherwise negotiates compression, which can drop Content-Length and weaken
@@ -496,7 +500,8 @@ class Bucket:
                 n += 1
                 if n > expected:
                     raise BlobError("invalid_input", f"body is longer than the declared {size} bytes")
-                future = pool.submit(send, n, chunk)
+                # In the caller's context, so event hooks and tracing see the request they belong to.
+                future = pool.submit(contextvars.copy_context().run, send, n, chunk)
                 # Sets cancel as soon as a part fails, so the others stop retrying while this thread reads.
                 future.add_done_callback(lambda f: settle({f}))
                 inflight.add(future)
