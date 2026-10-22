@@ -801,6 +801,41 @@ class TestParallelParts:
         assert not fake.uploads and "fail.bin" not in fake.objects
         assert len(reads) < 12
 
+    def test_a_failure_whose_callback_runs_late_is_still_reported(
+        self, fake: Fake, bucket: Bucket, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import threading
+        from concurrent.futures import _base
+
+        # Future.set_exception wakes wait() before it runs callbacks; widen that window.
+        original = _base.Future._invoke_callbacks  # type: ignore[attr-defined]
+
+        def late(self: Any) -> None:
+            if self._exception is not None:
+                threading.Event().wait(0.3)
+            original(self)
+
+        monkeypatch.setattr(_base.Future, "_invoke_callbacks", late)
+        landed = threading.Semaphore(0)
+
+        def last_fails(r: httpx.Request) -> Optional[httpx.Response]:
+            if not is_part(r):
+                return None
+            if r.url.params["partNumber"] != "3":
+                landed.release()
+                return None
+            # Fails only once parts 1 and 2 are answered, so wait() is left waiting on part 3 alone.
+            landed.acquire(timeout=5)
+            landed.acquire(timeout=5)
+            threading.Event().wait(0.1)
+            return error(400, "BadDigest")
+
+        fake.intercept = last_fails
+        with pytest.raises(BlobError) as e:
+            bucket.put("race.bin", b"z" * (15 * MIB), multipart=True)
+        assert e.value.status == 400
+        assert "race.bin" not in fake.objects and not fake.uploads
+
     def test_parts_refused_together_remint_once(self, fake: Fake, bucket: Bucket) -> None:
         import threading
 
@@ -858,6 +893,24 @@ class TestParallelParts:
             await asyncio.wait_for(abucket.put("slow.bin", body(), size=20 * MIB, multipart=True), 5)
         assert e.value.status == 400
         assert not fake.uploads
+
+
+async def test_async_a_failed_part_cancels_the_rest_after_the_body_ends(fake: Fake) -> None:
+    import asyncio
+
+    never = asyncio.Event()
+
+    async def handler(r: httpx.Request) -> httpx.Response:
+        if is_part(r):
+            if r.url.params["partNumber"] == "3":
+                return error(400, "BadDigest")
+            await never.wait()  # parts 1 and 2 hang until cancelled
+        return await fake.ahandler(r)
+
+    ab = AsyncBucket(TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(BlobError) as e:
+        await asyncio.wait_for(ab.put("drain.bin", b"d" * (12 * MIB), multipart=True), 5)
+    assert e.value.status == 400 and not fake.uploads
 
 
 class TestMetadataKeys:

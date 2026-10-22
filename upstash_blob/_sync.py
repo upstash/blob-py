@@ -446,8 +446,18 @@ class Bucket:
         concurrency = part_concurrency_for(part_size)
         upload_id = self._create_multipart(path, headers)
         cancel = threading.Event()
-        failures: List[BaseException] = []
+        lock = threading.Lock()
+        first: List[BaseException] = []
         etags: Dict[int, str] = {}
+
+        def fail(error: BaseException) -> None:
+            # The first failure is the one reported, wherever it happened; the parts it cancelled report nothing.
+            if isinstance(error, _Cancelled):
+                return
+            with lock:
+                if not first:
+                    first.append(error)
+            cancel.set()
 
         def send(n: int, chunk: bytes) -> None:
             res = self._fetch(
@@ -465,13 +475,12 @@ class Bucket:
                 raise BlobError("request_failed", f"part {n} landed without an etag", status=502)
             etags[n] = etag
 
-        def settle(done: "Future[None]") -> None:
-            error = done.exception()
-            # The first failure is the one reported; the parts it cancelled report nothing.
-            if error is not None and not isinstance(error, _Cancelled):
-                if not failures:
-                    failures.append(error)
-                cancel.set()
+        def settle(done: Set["Future[None]"]) -> None:
+            # Read here as well as in the done callback: wait() can return before the callback has run.
+            for f in done:
+                error = f.exception()
+                if error is not None:
+                    fail(error)
 
         pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="upstash-blob-part")
         inflight: Set[Future[None]] = set()
@@ -479,36 +488,44 @@ class Bucket:
         try:
             sent = 0
             n = 0
-            for chunk in parts:
-                if failures:
+            # Checked before each read, so a failure stops the body from being read any further.
+            while not cancel.is_set():
+                chunk = next(parts, None)
+                if chunk is None:
                     break
                 n += 1
                 if n > expected:
                     raise BlobError("invalid_input", f"body is longer than the declared {size} bytes")
                 future = pool.submit(send, n, chunk)
-                future.add_done_callback(settle)
+                # Sets cancel as soon as a part fails, so the others stop retrying while this thread reads.
+                future.add_done_callback(lambda f: settle({f}))
                 inflight.add(future)
                 sent += len(chunk)
                 del chunk
-                while len(inflight) >= concurrency and not failures:
-                    _, inflight = wait(inflight, return_when=FIRST_COMPLETED)
-            wait(inflight)
-            if failures:
-                raise failures[0]
+                while len(inflight) >= concurrency and not cancel.is_set():
+                    done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    settle(done)
+            done, inflight = wait(inflight)
+            settle(done)
+            if first:
+                raise first[0]
             if sent != size:
                 raise BlobError("invalid_input", f"body was {sent} bytes, {size} were declared")
+            if len(etags) != n:
+                raise BlobError("request_failed", f"{n - len(etags)} of {n} parts did not land", status=502)
             etag = self._complete_multipart(path, upload_id, sorted(etags.items()))
         except BaseException as e:
+            if isinstance(e, Exception):
+                fail(e)
             # A part still in flight would land after the abort and be billed with nothing to list it.
             cancel.set()
             wait(inflight)
-            pool.shutdown()
             parts.close()
             # Nothing lists an incomplete upload, so a failure that left one behind is invisible billing.
             with contextlib.suppress(Exception):
                 self._abort_multipart(path, upload_id)
-            if failures and failures[0] is not e and isinstance(e, Exception):
-                raise failures[0] from None
+            if first and first[0] is not e and isinstance(e, Exception):
+                raise first[0] from None
             raise
         finally:
             pool.shutdown()
