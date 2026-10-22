@@ -277,7 +277,7 @@ def parts_of(data: Data, part_size: int) -> Generator[bytes, None, None]:
         while len(buf) >= part_size:
             yield _take(buf, part_size)
     if buf:
-        yield bytes(buf)
+        yield _take(buf, len(buf))
 
 
 # ----------------------------------------------------------------- async
@@ -359,4 +359,4 @@ async def aparts_of(data: AsyncData, part_size: int) -> AsyncGenerator[bytes, No
         while len(buf) >= part_size:
             yield _take(buf, part_size)
     if buf:
-        yield bytes(buf)
+        yield _take(buf, len(buf))

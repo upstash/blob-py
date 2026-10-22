@@ -47,8 +47,8 @@ async with AsyncBucket.from_env() as bucket:
   needs `size=` or `max_size=`.
 - `content_types=["image/*"]` checks the declared type and the file's first bytes; `max_size="20mb"`
   refuses anything larger, while streaming too.
-- A body over 16 MB goes up as multipart, up to four parts at a time within a 64 MiB buffer;
-  `multipart="100mb" | True | False` moves the line. A failed part aborts the upload.
+- A body over 16 MB goes up as multipart, up to four parts at a time (fewer past 3 GB, to bound
+  memory); `multipart="100mb" | True | False` moves the line. A failed part aborts the upload.
   `allow_overwrite=False` and `if_unchanged=etag` are single-PUT only.
 - `get` and `info` raise `not_found` rather than returning None; `list` returns keys, sizes, etags
   and urls, without metadata. `cursor` is set only while more remains.

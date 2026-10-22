@@ -915,6 +915,43 @@ class TestParallelParts:
         assert time.monotonic() - began < 2  # the body's own 0.3 s, not the 5 s guard
         assert not fake.uploads
 
+    async def test_async_a_part_failure_stops_reading_and_wins_over_a_later_body_error(self, fake: Fake) -> None:
+        import asyncio
+
+        answered = asyncio.Event()
+
+        async def handler(r: httpx.Request) -> httpx.Response:
+            if is_part(r) and r.url.params["partNumber"] == "1":
+                answered.set()
+                return error(400, "BadDigest")
+            return await fake.ahandler(r)
+
+        async def turns(n: int) -> None:
+            # conftest makes asyncio.sleep a no-op, so hand the loop over by hand.
+            loop = asyncio.get_running_loop()
+            for _ in range(n):
+                f = loop.create_future()
+                loop.call_soon(f.set_result, None)
+                await f
+
+        reads = []
+
+        async def body() -> Any:
+            for i in range(12):
+                if i == 1:
+                    await asyncio.wait_for(answered.wait(), 5)
+                    await turns(20)  # part 1's failure is settled before part 2 is handed over
+                if i == 2:
+                    raise OSError("the source broke")
+                reads.append(i)
+                yield b"x" * (5 * MIB)
+
+        ab = AsyncBucket(TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        with pytest.raises(BlobError) as e:
+            await ab.put("afail.bin", body(), size=60 * MIB, multipart=True)
+        assert e.value.status == 400
+        assert reads == [0, 1] and not fake.uploads
+
     def test_parts_run_in_the_callers_context(self, fake: Fake, bucket: Bucket) -> None:
         import contextvars
 

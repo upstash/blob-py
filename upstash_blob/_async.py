@@ -424,9 +424,9 @@ class AsyncBucket:
         """
         Up to four parts in flight, each buffered whole so it can be retried. Reading waits for a
         free slot, so the body is never read further ahead than the parts being sent and the one
-        filling. The body is read in the caller's task, so a timeout or cancel scope it holds across
-        its yields still applies. An error cancels the parts still in flight and waits for them,
-        then aborts the upload rather than leaving parts behind that nothing can see.
+        filling. The body is read in the caller's task, never one spawned per read. The first error
+        stops the reading and cancels the parts still in flight, waits for them, then aborts the
+        upload rather than leaving parts behind that nothing can see.
         """
         part_size = part_size_for(size)
         expected = part_count(size, part_size)
@@ -450,33 +450,36 @@ class AsyncBucket:
                 raise BlobError("request_failed", f"part {n} landed without an etag", status=502)
             etags[n] = etag
 
-        def settle(done: Set["asyncio.Task[None]"]) -> None:
+        def settle(task: "asyncio.Task[None]") -> None:
+            # A done callback, so a failure is seen while the body is being read, not only at a wait.
             # The first failure is the one reported; the parts it cancelled report nothing.
-            for t in done:
-                if not t.cancelled() and t.exception() is not None and not first:
-                    first.append(t.exception())  # type: ignore[arg-type]
+            if not task.cancelled() and task.exception() is not None and not first:
+                first.append(task.exception())  # type: ignore[arg-type]
 
         inflight: Set[asyncio.Task[None]] = set()
         parts = _body.aparts_of(data, part_size)
         try:
             sent = 0
             n = 0
-            async for chunk in parts:
+            # Checked before each read, so a failure stops the body from being read any further.
+            while not first:
+                try:
+                    chunk = await parts.__anext__()
+                except StopAsyncIteration:
+                    break
                 n += 1
                 if n > expected:
                     raise BlobError("invalid_input", f"body is longer than the declared {size} bytes")
-                inflight.add(asyncio.ensure_future(send(n, chunk)))
+                task = asyncio.ensure_future(send(n, chunk))
+                task.add_done_callback(settle)
+                inflight.add(task)
                 sent += len(chunk)
                 del chunk
                 # A failed part is a finished task, so it wakes this wait like any other.
                 while len(inflight) >= concurrency and not first:
-                    done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
-                    settle(done)
-                if first:
-                    break
+                    _, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
             while inflight and not first:
-                done, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
-                settle(done)
+                _, inflight = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
             if first:
                 raise first[0]
             if sent != size:
@@ -492,8 +495,7 @@ class AsyncBucket:
             for t in inflight:
                 t.cancel()
             if inflight:
-                done, _ = await asyncio.wait(inflight)
-                settle(done)
+                await asyncio.wait(inflight)
             with contextlib.suppress(Exception):
                 await parts.aclose()
             # Nothing lists an incomplete upload, so a failure that left one behind is invisible billing.
