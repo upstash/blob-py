@@ -628,9 +628,13 @@ def owner_string(value: Any) -> str:
     """
     if value is None or value == "":
         raise BlobError("unauthorized", "no signed-in user to own this upload")
-    if isinstance(value, bool) or not isinstance(value, (str, int)):
-        raise TypeError(f"owner must return a str or an int, got {type(value).__name__}")
-    return str(value)
+    # A bool is a check that went wrong, not an id: True would make every user the same owner.
+    if isinstance(value, bool):
+        raise TypeError("owner must return an id, got a bool")
+    owner = str(value)
+    if not owner:
+        raise BlobError("unauthorized", "no signed-in user to own this upload")
+    return owner
 
 
 def check_owner_option(owner: Optional[Callback], context: Optional[Callback]) -> None:

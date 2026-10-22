@@ -766,8 +766,8 @@ class TestParallelParts:
     def test_concurrency_shrinks_with_the_part_size(self) -> None:
         from upstash_blob._multipart import part_concurrency_for
 
-        sizes = [5, 12, 13, 15, 16, 22, 32, 40]
-        assert [part_concurrency_for(s * MIB) for s in sizes] == [4, 4, 3, 3, 3, 1, 1, 1]
+        sizes = [5, 16, 17, 21, 22, 32, 33, 40]
+        assert [part_concurrency_for(s * MIB) for s in sizes] == [4, 4, 3, 3, 2, 2, 1, 1]
 
     def test_four_parts_are_in_flight_at_once(self, fake: Fake, bucket: Bucket) -> None:
         import threading
@@ -787,7 +787,23 @@ class TestParallelParts:
         assert not fake.uploads
 
     def test_the_first_failure_aborts_and_stops_reading(self, fake: Fake, bucket: Bucket) -> None:
-        fake.intercept = lambda r: error(400, "BadDigest") if is_part(r) and r.url.params["partNumber"] == "2" else None
+        import threading
+
+        four = threading.Barrier(4, timeout=5)
+        answered = threading.Event()
+
+        def first_fails(r: httpx.Request) -> Optional[httpx.Response]:
+            if not is_part(r):
+                return None
+            four.wait()  # every slot is taken, so the reader is waiting for one to free
+            if r.url.params["partNumber"] == "1":
+                answered.set()
+                return error(400, "BadDigest")
+            answered.wait(5)
+            threading.Event().wait(0.2)
+            return None
+
+        fake.intercept = first_fails
         reads = []
 
         def body() -> Iterator[bytes]:
@@ -799,7 +815,7 @@ class TestParallelParts:
             bucket.put("fail.bin", body(), size=60 * MIB, multipart=True)
         assert e.value.status == 400
         assert not fake.uploads and "fail.bin" not in fake.objects
-        assert len(reads) < 12
+        assert reads == [0, 1, 2, 3]
 
     def test_a_failure_whose_callback_runs_late_is_still_reported(
         self, fake: Fake, bucket: Bucket, monkeypatch: pytest.MonkeyPatch

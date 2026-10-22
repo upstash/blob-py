@@ -247,12 +247,15 @@ class AsyncUploadHandler:
             return
 
         async def run() -> None:
+            allowed: Optional[bool] = None
             try:
                 res = await bucket._client.request(**CorsProbe.request(claimed, url, headers))
                 allowed = CorsProbe.verdict(claimed, res)
             except Exception:
-                allowed = None
-            self._cors.settle(claimed, allowed)
+                pass
+            finally:
+                # Also when the loop cancels the probe on shutdown: unanswered, so asked again next time.
+                self._cors.settle(claimed, allowed)
 
         # Held until done: the event loop keeps only a weak reference to a task.
         task = asyncio.ensure_future(run())

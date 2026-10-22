@@ -44,14 +44,14 @@ def part_count(size: int, part_size: int) -> int:
     return max(1, math.ceil(size / part_size))
 
 
-# Every part is buffered whole so a failed one can be sent again, and one more fills while the rest
-# are in flight, so each costs its size in memory. Four overlap the round trips the way boto3's
-# transfer manager does; past 12 MiB parts (bodies over about 3 GB) fewer go at once to stay within
-# the budget, down to one from 22 MiB parts (about 5.5 GB).
+# Every part is buffered whole so a failed one can be sent again, and the next one is read only once a
+# slot is free, so each part in flight costs its size in memory. Four overlap the round trips the way
+# boto3's transfer manager does; past 16 MiB parts (bodies over about 4 GB) fewer go at once to stay
+# within the budget, down to one past 32 MiB parts (about 8 GB).
 PART_CONCURRENCY = 4
 _PART_BUFFER_BUDGET = 64 * _MIB
 
 
 def part_concurrency_for(part_size: int) -> int:
-    """Parts sent at once for this part size: up to four, with the one filling, within 64 MiB; never under one."""
-    return max(1, min(PART_CONCURRENCY, _PART_BUFFER_BUDGET // part_size - 1))
+    """Parts sent at once for this part size: up to four, within 64 MiB; never under one."""
+    return max(1, min(PART_CONCURRENCY, _PART_BUFFER_BUDGET // part_size))

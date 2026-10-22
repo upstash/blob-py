@@ -498,6 +498,7 @@ class AsyncBucket:
                 raise first[0]
             if sent != size:
                 raise BlobError("invalid_input", f"body was {sent} bytes, {size} were declared")
+            # Every part either landed or failed above; this guards the object against a part gone missing.
             if len(etags) != n:
                 raise BlobError("request_failed", f"{n - len(etags)} of {n} parts did not land", status=502)
             etag = await self._complete_multipart(path, upload_id, sorted(etags.items()))

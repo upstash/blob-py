@@ -709,6 +709,11 @@ async def test_owner_takes_ints_and_refuses_nobody_before_anything_runs(client: 
     )
     status, begun = await client.begin(h, request={"id": 7})
     assert status == 200 and verify_grant(begun["completionToken"], "pw-secret").owner == "7"  # type: ignore[union-attr]
+    import uuid
+
+    uid = uuid.UUID(int=1)
+    status, begun = await client.begin(h, request={"id": uid})
+    assert status == 200 and verify_grant(begun["completionToken"], "pw-secret").owner == str(uid)  # type: ignore[union-attr]
     ran.clear()
     presigns = len(fake.presigns)
     for nobody in ({}, {"id": ""}, {"id": None}):
@@ -782,6 +787,36 @@ async def test_a_refused_preflight_is_logged_once_per_origin(
     assert "x-amz-meta-upstash-upload" in first.headers["access-control-request-headers"].split(",")
     warnings = [r.getMessage() for r in caplog.records if "CORS preflight" in r.getMessage()]
     assert len(warnings) == 1 and "https://app.example" in warnings[0]
+
+
+async def test_a_probe_cancelled_by_the_loop_is_asked_again(fake: Fake) -> None:
+    import asyncio
+
+    started = asyncio.Event()
+    seen: List[httpx.Request] = []
+
+    async def handler(r: httpx.Request) -> httpx.Response:
+        if r.method == "OPTIONS":
+            seen.append(r)
+            started.set()
+            await asyncio.Event().wait()  # the loop shuts down first
+        return await fake.ahandler(r)
+
+    bucket = AsyncBucket(TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    h = AsyncUploadHandler(bucket=bucket, on_before_upload=before())
+    client = Client(fake, "async")
+    await client.begin(h, headers={"origin": "https://app.example"})
+    await asyncio.wait_for(started.wait(), 5)
+    for t in list(h._probes):
+        t.cancel()
+    await asyncio.gather(*h._probes, return_exceptions=True)
+    started.clear()
+    await client.begin(h, headers={"origin": "https://app.example"})
+    await asyncio.wait_for(started.wait(), 5)
+    assert len(seen) == 2
+    for t in list(h._probes):
+        t.cancel()
+    await asyncio.gather(*h._probes, return_exceptions=True)
 
 
 async def test_a_preflight_storage_did_not_answer_is_asked_again(client: Client, fake: Fake) -> None:
