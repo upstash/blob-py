@@ -518,8 +518,6 @@ class Grant:
     """Storage's multipart id. None for a single PUT: there is no upload to complete or abort."""
     part_size: int
     """The part size for a multipart, and the whole file for a single PUT, so one part covers it."""
-    owner: Optional[str] = None
-    """The handler's ``owner`` of whoever began the upload; every later request must match it."""
 
     @property
     def file(self) -> FileInfo:
@@ -549,8 +547,6 @@ def sign_grant(g: Grant, key: str) -> str:
     }
     if g.upload_id is not None:
         payload["uploadId"] = g.upload_id
-    if g.owner is not None:
-        payload["o"] = g.owner
     try:
         raw = json.dumps(payload, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError):
@@ -583,7 +579,6 @@ def verify_grant(token: str, key: str) -> Optional[Grant]:
             exp=p["exp"],
             upload_id=upload_id,
             part_size=p["partSize"],
-            owner=p.get("o"),
         )
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
@@ -594,15 +589,11 @@ def verify_grant(token: str, key: str) -> Optional[Grant]:
         and all(_int(n) is not None for n in (grant.size, grant.exp, grant.part_size))
         and grant.part_size > 0
         and (upload_id is None or isinstance(upload_id, str))
-        and (grant.owner is None or isinstance(grant.owner, str))
     )
     return grant if ok else None
 
 
-def check_grant(
-    token: Any, key: str, bucket_id: str, route: str, details: Details, owner: Optional[str] = None
-) -> Grant:
-    """``owner`` is who sent this request, when the handler binds uploads to one; None when it does not."""
+def check_grant(token: Any, key: str, bucket_id: str, route: str, details: Details) -> Grant:
     if not isinstance(token, str):
         raise BlobError("invalid_input", "completionToken is required")
     g = verify_grant(token, key)
@@ -610,38 +601,9 @@ def check_grant(
         raise BlobError("forbidden", "completionToken is not valid for this route")
     if g.exp < time.time() * 1000:
         raise BlobError("forbidden", "completionToken has expired")
-    # A token is a bearer capability, so without this anyone signed in who holds one could finish,
-    # re-sign or cancel somebody else's upload. Checked before storage or any callback is touched,
-    # and before details names the path, so a refusal tells the caller nothing about the upload.
-    if owner is not None and g.owner != owner:
-        raise BlobError("forbidden", "this upload belongs to another user")
     details.path = g.path
     details.state = g.state
     return g
-
-
-def owner_string(value: Any) -> str:
-    """
-    What the handler's ``owner`` returned, as the string signed into the token. A session lookup
-    that found nobody reads as ``user.id if user else None``: that is a 401, never an upload owned
-    by "None".
-    """
-    if value is None or value == "":
-        raise BlobError("unauthorized", "no signed-in user to own this upload")
-    # A bool is a check that went wrong, not an id: True would make every user the same owner.
-    if isinstance(value, bool):
-        raise TypeError("owner must return an id, got a bool")
-    owner = str(value)
-    if not owner:
-        raise BlobError("unauthorized", "no signed-in user to own this upload")
-    return owner
-
-
-def check_owner_option(owner: Optional[Callback], context: Optional[Callback]) -> None:
-    if owner is not None and context is None:
-        raise TypeError("owner reads ctx, so it needs a context")
-    if owner is not None and not callable(owner):
-        raise TypeError("owner must be a function of ctx")
 
 
 def token_expiry() -> int:

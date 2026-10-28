@@ -21,7 +21,7 @@ from upstash_blob import (
     UploadResponse,
     UploadRoute,
 )
-from upstash_blob._upload import sign_grant, verify_grant
+from upstash_blob._upload import _mac, sign_grant, verify_grant
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 MIB = 1024 * 1024
@@ -673,78 +673,19 @@ async def test_deeply_nested_json_is_a_refusal(client: Client) -> None:
     assert (status, body["code"]) == (400, "invalid_input")
 
 
-# -------------------------------------------------------------------- owner
+# ------------------------------------------------------------ v0.1.0 tokens
 
 
-def owned(client: Client, **kw: Any) -> Handler:
-    return client.handler(
-        context=lambda req: req, owner=lambda req: req["user"], on_before_upload=before(), multipart="1mb", **kw
-    )
-
-
-async def test_owner_binds_every_later_request_to_who_began(client: Client, fake: Fake) -> None:
-    h = owned(client)
-    u1, u2 = {"user": "u1"}, {"user": "u2"}
-    status, begun = await client.begin(h, size=3 * MIB, type="application/octet-stream", request=u1)
-    assert status == 200, begun
-    token = begun["completionToken"]
-    assert verify_grant(token, "pw-secret").owner == "u1"  # type: ignore[union-attr]
-    for phase in ("parts", "end", "cancel"):
-        status, body = await client.post(h, {"phase": phase, "completionToken": token}, request=u2)
-        assert (status, body["code"], body["message"]) == (403, "forbidden", "This upload belongs to another user")
-        assert "path" not in body
-    assert fake.uploads  # nothing was cancelled or completed by u2
-    status, body = await client.post(h, {"phase": "parts", "completionToken": token, "from": 1}, request=u1)
-    assert status == 200, body
-    status, _ = await client.post(h, {"phase": "cancel", "completionToken": token}, request=u1)
-    assert status == 200 and not fake.uploads
-
-
-async def test_owner_takes_ints_and_refuses_nobody_before_anything_runs(client: Client, fake: Fake) -> None:
-    ran: List[Any] = []
-    h = client.handler(
-        context=lambda req: req,
-        owner=lambda req: req.get("id"),
-        on_before_upload=lambda a: ran.append(a) or BeforeUploadResult(path="up/a.png"),
-    )
-    status, begun = await client.begin(h, request={"id": 7})
-    assert status == 200 and verify_grant(begun["completionToken"], "pw-secret").owner == "7"  # type: ignore[union-attr]
-    import uuid
-
-    uid = uuid.UUID(int=1)
-    status, begun = await client.begin(h, request={"id": uid})
-    assert status == 200 and verify_grant(begun["completionToken"], "pw-secret").owner == str(uid)  # type: ignore[union-attr]
-    ran.clear()
-    presigns = len(fake.presigns)
-    for nobody in ({}, {"id": ""}, {"id": None}):
-        status, body = await client.begin(h, request=nobody)
-        assert (status, body["code"]) == (401, "unauthorized")
-    assert not ran and len(fake.presigns) == presigns
-
-
-async def test_a_token_minted_without_an_owner_is_refused_by_a_handler_with_one(client: Client) -> None:
-    plain = client.handler(on_before_upload=before())
-    _, begun = await client.begin(plain)
-    h = client.handler(context=lambda req: req, owner=lambda req: "u1", on_before_upload=before())
-    status, body = await client.post(h, end_of(begun), request={})
-    assert (status, body["code"]) == (403, "forbidden")
-
-
-def test_owner_needs_a_context(fake: Fake) -> None:
-    bucket = Bucket(TOKEN, http_client=httpx.Client(transport=httpx.MockTransport(fake.handler)))
-    with pytest.raises(TypeError, match="needs a context"):
-        UploadHandler(bucket=bucket, owner=lambda u: u, on_before_upload=before())
-
-
-async def test_async_handler_awaits_an_async_owner(fake: Fake) -> None:
-    async def who(ctx: Any) -> str:
-        return "u1"
-
-    bucket = AsyncBucket(TOKEN, http_client=httpx.AsyncClient(transport=httpx.MockTransport(fake.ahandler)))
-    h = AsyncUploadHandler(bucket=bucket, context=lambda r: r, owner=who, on_before_upload=before())
-    client = Client(fake, "async")
-    status, begun = await client.begin(h)
-    assert status == 200 and verify_grant(begun["completionToken"], "pw-secret").owner == "u1"  # type: ignore[union-attr]
+async def test_a_token_with_an_owner_claim_still_completes(client: Client) -> None:
+    # v0.1.0's owner option signed an "o" claim; a token minted before the upgrade still finishes.
+    h = client.handler(on_before_upload=before())
+    _, begun = await client.begin(h)
+    body = begun["completionToken"].split(".")[0]
+    payload = {**json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))), "o": "u1"}
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    client.put(begun, PNG)
+    status, done = await client.post(h, {**end_of(begun), "completionToken": f"{body}.{_mac(body, 'pw-secret')}"})
+    assert status == 200, done
 
 
 # --------------------------------------------------------------- CORS probe
