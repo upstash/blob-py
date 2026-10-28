@@ -91,7 +91,6 @@ from upstash_blob.fastapi import upload_view
 
 uploads = AsyncUploadHandler(
     context=require_user,  # its return is `ctx`; raise a 401 to refuse
-    owner=lambda user: user.id,  # binds each upload to who began it
     on_before_upload=lambda a: BeforeUploadResult(path=unique_path(f"u/{a.ctx.id}/{a.file.name}")),
     on_upload_complete=lambda a: {"url": a.url},  # reaches the browser as upload.blob.data
     routes={
@@ -112,9 +111,7 @@ const upload = useUpload('avatar');  // POSTs to /api/upload?route=avatar
   route=..., body=..., headers=..., native=<framework response class>)` returns an `UploadResponse`.
 - Omit `bucket=` to use `UPSTASH_BLOB_TOKEN`. Every handler option is a default a route may replace;
   `content_types=None` or `max_size=None` on a route clears the handler's.
-- `context` runs on every POST of an upload: check the session there. `owner` signs who began an
-  upload into it; a later request from anyone else is a 403, so one signed-in user cannot finish,
-  re-sign or cancel another's upload. An `owner` of None or `""` is a 401.
+- `context` runs on every POST of an upload: check the session there.
 - The first upload from each page origin also sends storage the CORS preflight the browser will, and
   logs a warning on the `upstash_blob` logger when storage refuses it: add the origin to the bucket's
   CORS settings in the Upstash Console.
